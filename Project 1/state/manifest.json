@@ -1,0 +1,18 @@
+{
+  "processed_files": [
+    {
+      "filename": "data/inbox/file2.parquet",
+      "size": 204800,
+      "row_count": 3000,
+      "last_processed": "2026-03-05T12:10:00Z"
+    },
+    {
+      "filename": "data/inbox/yellow_tripdata_2025-01.parquet",
+      "status": "processing"
+    },
+    {
+      "filename": "data/inbox/yellow_tripdata_2025-02.parquet",
+      "status": "processing"
+    }
+  ]
+}
