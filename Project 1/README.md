@@ -1,6 +1,6 @@
 # Project 1
 
-This is a report for project 1.
+This is a report for project 1 by group F or "Humongous Data".
 
 To start up the program run the following code in /'Project 1' folder.
 
@@ -11,6 +11,35 @@ docker compose up -d
 Jupyter Notebook can be accessed through: <http://localhost:8888>
 
 Spark can be accessed through: <http://localhost:4040>
+
+
+## Project structure
+```
+Project 1/
+├─ README.md
+├─ data/
+│   ├─ inbox/
+│   │   └─ data in .parquet files
+│   ├─ outbox/
+│   └─ taxi_zone_lookup.parquet
+├─ state/
+│   └─ manifest.json
+├─ images/
+├─ compose.yml
+└─ Project1_notebook.ipynb
+```
+
+The state of the pipeline and processed files is stored in the state/manifest.json file. The file contains a processed_files list that contains the following info about the files:
+- filename
+- processing status (processed or processing)
+- file size
+- row count
+
+We trigger a new processing of a file that we have already processed once before when
+- processing status is "processing" (It means that we didn't finish processing last time)
+- file size has changed
+- row count has changed
+
 
 ## Correctness
 
@@ -69,11 +98,18 @@ Zones are defined by their own unique key Location ID.
 
 ## Performance
 
-Runtime for the whole job by measuring time spent in the notebook: ~110.26 seconds
+Runtime for the whole job by measuring time spent in the notebook: ~75 seconds. A lot of our time cost is coming from illustrating and getting examples- functions that normally we would not use, but we are trying to illustrate a point. In particular, the sort() function calls on our whole dataset that we used to show some examples of bad rows we are removing, cost us a lot. See the image below.
 
-<span style="color: red">TODO: two Spark Web UI screenshots</span>
+![alt text](images/Sort_function_SQL_time.png)
 
-<span style="color: red">TODO: two concrete optimization choices (broadcast?)</span>
+Here we can also see that a specific stage is taking a lot of time and one task in particular as well. (Because it is spilling to the disk)
+
+![alt text](images/Stages_sorted_by_time.png)
+![alt text](images/Costly_stage_compute_time.png)
+
+### 2 concrete optimization choices we made were:
+1. Using *broadcast()* function instead of *join()* to only move the smaller "zones" table and not have to move the bigger "trips" table
+2. Repartitioning the "trips" table before using the costly *.DropDuplicates()* function. This way we split the work across all the workers more evenly and save time since having a clearly slower worker increases the overall time by a lot.
 
 ## Scenario
 
