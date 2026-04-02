@@ -39,7 +39,9 @@ _Include row counts before and after restart._
 
 ## 6. Custom scenario
 
-_Explain and/or show how you solved the custom scenario from the GitHub issue._
+Our scenario is as follows: 
+
+_Run produce.py with --rate 1 and again with --rate 50. In REPORT.md, include a Spark UI screenshot for both runs and compare batch processing time, records per batch, and scheduling delay. Explain what happens when the producer is faster than the consumer._
 
 ## 7. How to run
 
