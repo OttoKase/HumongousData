@@ -48,12 +48,20 @@ _Run produce.py with --rate 1 and again with --rate 50. In REPORT.md, include a 
 ```bash
 # Step 1: Start infrastructure
 docker compose up -d
+# NB! Make sure everything started without errors (except minio-init)
+
+# Step 1.5: Start the kafka topic IF RUNNING IN A NEW CONTAINER (not restarted. If restarted, skip)
+docker exec kafka sh -c "/opt/kafka/bin/kafka-topics.sh \
+>>   --bootstrap-server localhost:9092 \
+>>   --create --topic taxi-trips --partitions 3 --replication-factor 1"
 
 # Step 2: Start the producer
-python produce.py
+# Simplest in jupyterlab. Open the terminal via launcher. See produce.py for more options
+python project/produce.py --rate 10
 
 # Step 3: Run the pipeline
-<your command here>
+
+<TODO> # In notebook currently
 ```
 
 _Add any additional steps or dependencies needed to reproduce your results._
