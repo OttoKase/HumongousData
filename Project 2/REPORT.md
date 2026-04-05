@@ -105,8 +105,7 @@ INT. `store_and_fwd_flag` is cast from `"Y"/"N"` string to BOOLEAN.
 Duplicate records are removed using the key `(VendorID, tpep_pickup_datetime, 
 PULocationID)`. The same vendor cannot start two trips from the same location at 
 the exact same timestamp — any such duplicates are assumed to be repeated Kafka 
-messages rather than distinct trips. Silver is rebuilt from bronze on each run 
-(`createOrReplace`) to ensure idempotency.
+messages rather than distinct trips.
 
 ### Enrichment
 
@@ -118,27 +117,88 @@ rather than dropped.
 
 ## 3. Streaming configuration
 
-_Describe:_
-- _Checkpoint path and what it stores._
-- _Trigger interval and why you chose it._
-- _Output mode (append/update/complete) and why._
-- _Watermark (if used) and why._
+### Checkpointing
+
+Each stream uses a dedicated checkpoint in:
+
+- /tmp/checkpoints/taxi_bronze
+- /tmp/checkpoints/taxi_silver
+- /tmp/checkpoints/taxi_gold
+
+They store: 
+- Kafka offsets
+- streaming progress
+- batch metadata
+
+This guarantees exactly-once processing and safe restarts without duplicates
+
+### Trigger intervals
+| Layer  | Trigger                          |
+| ------ | -------------------------------- |
+| Bronze | default (continuous micro-batch) |
+| Silver | 10 seconds                       |
+| Gold   | 30 seconds                       |
+This way bronze layer ingests continuously, silver layer balances latency vs processing cost and gold aggregates less frequently to reduce overhead
+
+### Output mode
+| Layer  | Mode                 |
+| ------ | -------------------- |
+| Bronze | append               |
+| Silver | foreachBatch + MERGE |
+| Gold   | foreachBatch + MERGE |
+
+So bronze is raw append-only ingestion, but Silver and Gold have idempotent upserts.
+
+### Watermark
+
+No watermark is used due to the deterministic way of producing the data (from the taxi-rides .parquet files) via produce.py and we dont have windwoing.
 
 ## 4. Gold table partitioning strategy
 
-_Explain your partitioning choice. Why this column(s)? What query patterns does it optimize?_
-_Show the Iceberg snapshot history (query output or screenshot)._
+Partitioning by day matches the access pattern of this pipeline, since gold aggregates are computed per day and most queries filter by date ranges (e.g., daily trends or recent data). This allows Iceberg to prune partitions efficiently and scan only the required days instead of the full table. Partitioning by pickup_zone was avoided because it has higher cardinality and would create many small files, degrading performance in this setup.
+
+output of `spark.sql("SELECT * FROM lakehouse.taxi.gold.snapshots").show(truncate=False)`:
+![snapshots](./images/snapshots_screenshot.png)
 
 ## 5. Restart proof
 
-_Show that stopping and restarting the pipeline does not produce duplicates._
-_Include row counts before and after restart._
+We verified idempotency by restarting the pipeline.
+
+![snapshots](./images/restart_screenshot.png)
 
 ## 6. Custom scenario
 
 Our scenario is as follows: 
 
 _Run produce.py with --rate 1 and again with --rate 50. In REPORT.md, include a Spark UI screenshot for both runs and compare batch processing time, records per batch, and scheduling delay. Explain what happens when the producer is faster than the consumer._
+
+### Producer with rate 1
+
+Screenshots for slow producer
+![rate1](./images/custom_scenario_rate1.png)
+![rate1](./images/custom_scenario_rate1_silver_visual.png)
+![rate1](./images/custom_scenario_rate1_silver_planning.png)
+
+- `numInputRows` ≈ 10
+- `processingRowsPerSecond` ≈ 9
+- `batchDuration` ≈ 1086 ms
+
+So batch sizes are small, processing time is low, no backlog and small scheduling delay
+
+
+### Producer with rate 50
+
+Screenshots for fast producer
+![rate50](./images/custom_scenario_rate50.png)
+![rate50](./images/custom_scenario_rate50_silver_visual.png)
+![rate50](./images/custom_scenario_rate50_silver_planning.png)
+
+- `numInputRows` ≈ 482
+- `processingRowsPerSecond` ≈ 336
+- `batchDuration` ≈ 1433 ms
+
+With the faster producer there were much larger batches, increased processing time, and higher load on system. Query planning also tripled in time consumption.
+
 
 ## 7. How to run
 
@@ -156,11 +216,8 @@ docker exec kafka sh -c "/opt/kafka/bin/kafka-topics.sh \
 # Simplest in jupyterlab. Open the terminal via launcher. See produce.py for more options
 python project/produce.py --rate 10
 
-# Step 3: Run the pipeline
+# Step 3: Run the pipeline by running all cells
 
-<TODO> # In notebook currently
 ```
 
-_Add any additional steps or dependencies needed to reproduce your results._
-
-_Include the `.env` values the grader should use to run your project._
+`.env` variables can be configured however you want.
