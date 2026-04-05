@@ -4,20 +4,104 @@
 
 ### Bronze
 
-_Table DDL or DataFrame schema. Explain what is stored and why it is kept as-is._
+```sql
+CREATE TABLE IF NOT EXISTS lakehouse.taxi.bronze (
+    kafka_key        STRING,
+    raw_value        STRING,
+    topic            STRING,
+    partition        INT,
+    offset           BIGINT,
+    kafka_timestamp  TIMESTAMP
+) USING iceberg
+```
+
+Bronze stores raw Kafka messages exactly as received — no parsing, no validation. 
+The full JSON payload is kept in `raw_value` so that no data is lost at ingestion 
+time. This allows reprocessing from bronze if cleaning rules change in the future.
 
 ### Silver
 
-_Table DDL or DataFrame schema. Explain what changed compared to bronze and why._
+```sql
+CREATE TABLE IF NOT EXISTS lakehouse.taxi.silver (
+    VendorID               INT,
+    tpep_pickup_datetime   TIMESTAMP,
+    tpep_dropoff_datetime  TIMESTAMP,
+    passenger_count        INT,
+    trip_distance          DOUBLE,
+    RatecodeID             INT,
+    store_and_fwd_flag     BOOLEAN,
+    PULocationID           INT,
+    DOLocationID           INT,
+    payment_type           INT,
+    fare_amount            DOUBLE,
+    extra                  DOUBLE,
+    mta_tax                DOUBLE,
+    tip_amount             DOUBLE,
+    tolls_amount           DOUBLE,
+    improvement_surcharge  DOUBLE,
+    total_amount           DOUBLE,
+    congestion_surcharge   DOUBLE,
+    Airport_fee            DOUBLE,
+    cbd_congestion_fee     DOUBLE,
+    trip_duration_minutes  INT,
+    avg_speed_kmh          DOUBLE,
+    pickup_zone            STRING,
+    pickup_borough         STRING,
+    dropoff_zone           STRING,
+    dropoff_borough        STRING,
+    kafka_timestamp        TIMESTAMP
+) USING iceberg
+```
+
+Silver parses the raw JSON from bronze, casts types to their correct 
+representations, applies cleaning rules, and enriches trips with zone names. 
+Two derived columns (`trip_duration_minutes`, `avg_speed_kmh`) are added to 
+support cleaning and downstream analysis.
 
 ### Gold
 
 _Table DDL or DataFrame schema. Explain the aggregation logic._
 
+---
+
 ## 2. Cleaning rules and enrichment
 
-_List each cleaning rule (nulls, invalid values, deduplication key) with a brief justification._
-_Describe the enrichment step (zone lookup join)._
+### Type casting
+
+The Kafka JSON payload serializes all numeric fields as floating point (e.g. 
+`"passenger_count": 2.0`). Fields are parsed as DOUBLE and then cast to their 
+correct types: `passenger_count`, `RatecodeID`, and `payment_type` are cast to 
+INT. `store_and_fwd_flag` is cast from `"Y"/"N"` string to BOOLEAN.
+
+### Cleaning rules
+
+| Rule | Filter | Justification |
+|------|--------|---------------|
+| Null passenger count | `passenger_count IS NOT NULL AND > 0` | A trip with no passengers is invalid |
+| Non-negative distance | `trip_distance >= 0` | Negative distance is physically impossible |
+| Valid trip direction | `dropoff_datetime > pickup_datetime` | Dropoff must be after pickup |
+| Valid RatecodeID | `RatecodeID IN (1,2,3,4,5,6,99)` | Per NYC TLC data dictionary; 99 = unknown |
+| Valid payment type | `payment_type IN (0,1,2,3,4,5,6)` | Per NYC TLC data dictionary |
+| Positive duration | `trip_duration_minutes > 0` | Zero duration means corrupt timestamps |
+| Realistic duration | `trip_duration_minutes < 1440` | NYC yellow taxis do not make multi-day trips |
+| Minimum speed | `avg_speed_kmh >= 2` | Below 2 km/h suggests corrupt timestamps |
+| Maximum speed | `avg_speed_kmh <= 130` | Above 130 km/h is unrealistic for NYC roads |
+
+### Deduplication
+
+Duplicate records are removed using the key `(VendorID, tpep_pickup_datetime, 
+PULocationID)`. The same vendor cannot start two trips from the same location at 
+the exact same timestamp — any such duplicates are assumed to be repeated Kafka 
+messages rather than distinct trips. Silver is rebuilt from bronze on each run 
+(`createOrReplace`) to ensure idempotency.
+
+### Enrichment
+
+Trips are enriched with human-readable zone names by joining the 
+`taxi_zone_lookup.parquet` reference table on `PULocationID` and `DOLocationID`. 
+This adds `pickup_zone`, `pickup_borough`, `dropoff_zone`, and `dropoff_borough` 
+columns. A left join is used so that trips with unknown location IDs are retained 
+rather than dropped.
 
 ## 3. Streaming configuration
 
