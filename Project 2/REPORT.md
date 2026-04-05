@@ -83,6 +83,20 @@ Updated via `MERGE INTO` on `(day, pickup_zone)` so restarts are idempotent.
 _List each cleaning rule (nulls, invalid values, deduplication key) with a brief justification._
 _Describe the enrichment step (zone lookup join)._
 
+| Rule | Condition | Justification |
+|------|-----------|---------------|
+| Null passengers | `passenger_count` > 0 and not null | Trips with zero passengers are invalid |
+| Valid distance | `trip_distance` >= 0 | Distance cannot be negative |
+| Valid time order | `dropoff` > `pickup` | Dropoff before pickup is logically impossible |
+| Valid rate code | `RatecodeID` in [1,2,3,4,5,6,99] | Values outside NYC TLC spec are invalid |
+| Valid payment | `payment_type` in [0,1,2,3,4,5,6] | Values outside NYC TLC spec are invalid |
+| Trip duration | 0 < `trip_duration_minutes` < 1440 | Trips cannot be negative in duration or exceed 24 hours (NYC taxis aren't usually given out for more than a day) |
+| Reasonable speed | 2 <= `avg_speed_kmh` <= 130 | Speeds <2 km/h are too slow, >130 km/h are unrealistic in NYC traffic. |
+
+Deduplication is applied via `MERGE INTO` keyed on `(VendorID, tpep_pickup_datetime, PULocationID)`. This combination uniquely identifies a trip: the same vendor cannot start two trips from the same location at the exact same time.
+
+The silver layer joins the `taxi_zone_lookup` table twice using `PULocationID` and `DOLocationID` as keys. This adds four new columns: `pickup_zone`, `pickup_borough`, `dropoff_zone`, and `dropoff_borough`. The join is a left join so trips with unknown location IDs are kept rather than dropped. The lookup table is broadcast since it contains only ~270 rows. Before joining, the lookup table itself is cleaned: rows where `LocationID`, `Borough`, or `Zone` is null or negative are dropped, and duplicate `LocationID` entries are removed.
+
 ## 3. Streaming configuration
 
 _Describe:_
