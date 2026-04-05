@@ -47,7 +47,6 @@ CREATE TABLE lakehouse.taxi.silver (
     pickup_borough          STRING,
     dropoff_zone            STRING,
     dropoff_borough         STRING,
-    is_peak_hour            BOOLEAN,
     kafka_timestamp         TIMESTAMP
 ) USING iceberg
 ```
@@ -80,22 +79,42 @@ Updated via `MERGE INTO` on `(day, pickup_zone)` so restarts are idempotent.
 
 ## 2. Cleaning rules and enrichment
 
-_List each cleaning rule (nulls, invalid values, deduplication key) with a brief justification._
-_Describe the enrichment step (zone lookup join)._
+### Type casting
 
-| Rule | Condition | Justification |
-|------|-----------|---------------|
-| Null passengers | `passenger_count` > 0 and not null | Trips with zero passengers are invalid |
-| Valid distance | `trip_distance` >= 0 | Distance cannot be negative |
-| Valid time order | `dropoff` > `pickup` | Dropoff before pickup is logically impossible |
-| Valid rate code | `RatecodeID` in [1,2,3,4,5,6,99] | Values outside NYC TLC spec are invalid |
-| Valid payment | `payment_type` in [0,1,2,3,4,5,6] | Values outside NYC TLC spec are invalid |
-| Trip duration | 0 < `trip_duration_minutes` < 1440 | Trips cannot be negative in duration or exceed 24 hours (NYC taxis aren't usually given out for more than a day) |
-| Reasonable speed | 2 <= `avg_speed_kmh` <= 130 | Speeds <2 km/h are too slow, >130 km/h are unrealistic in NYC traffic. |
+The Kafka JSON payload serializes all numeric fields as floating point (e.g. 
+`"passenger_count": 2.0`). Fields are parsed as DOUBLE and then cast to their 
+correct types: `passenger_count`, `RatecodeID`, and `payment_type` are cast to 
+INT. `store_and_fwd_flag` is cast from `"Y"/"N"` string to BOOLEAN.
 
-Deduplication is applied via `MERGE INTO` keyed on `(VendorID, tpep_pickup_datetime, PULocationID)`. This combination uniquely identifies a trip: the same vendor cannot start two trips from the same location at the exact same time.
+### Cleaning rules
 
-The silver layer joins the `taxi_zone_lookup` table twice using `PULocationID` and `DOLocationID` as keys. This adds four new columns: `pickup_zone`, `pickup_borough`, `dropoff_zone`, and `dropoff_borough`. The join is a left join so trips with unknown location IDs are kept rather than dropped. The lookup table is broadcast since it contains only ~270 rows. Before joining, the lookup table itself is cleaned: rows where `LocationID`, `Borough`, or `Zone` is null or negative are dropped, and duplicate `LocationID` entries are removed.
+| Rule | Filter | Justification |
+|------|--------|---------------|
+| Null passenger count | `passenger_count IS NOT NULL AND > 0` | A trip with no passengers is invalid |
+| Non-negative distance | `trip_distance >= 0` | Negative distance is physically impossible |
+| Valid trip direction | `dropoff_datetime > pickup_datetime` | Dropoff must be after pickup |
+| Valid RatecodeID | `RatecodeID IN (1,2,3,4,5,6,99)` | Per NYC TLC data dictionary; 99 = unknown |
+| Valid payment type | `payment_type IN (0,1,2,3,4,5,6)` | Per NYC TLC data dictionary |
+| Positive duration | `trip_duration_minutes > 0` | Zero duration means corrupt timestamps |
+| Realistic duration | `trip_duration_minutes < 1440` | NYC yellow taxis do not make multi-day trips |
+| Minimum speed | `avg_speed_kmh >= 2` | Below 2 km/h suggests corrupt timestamps |
+| Maximum speed | `avg_speed_kmh <= 130` | Above 130 km/h is unrealistic for NYC roads |
+
+### Deduplication
+
+Duplicate records are removed using the key `(VendorID, tpep_pickup_datetime, 
+PULocationID)`. The same vendor cannot start two trips from the same location at 
+the exact same timestamp — any such duplicates are assumed to be repeated Kafka 
+messages rather than distinct trips. Silver is rebuilt from bronze on each run 
+(`createOrReplace`) to ensure idempotency.
+
+### Enrichment
+
+Trips are enriched with human-readable zone names by joining the 
+`taxi_zone_lookup.parquet` reference table on `PULocationID` and `DOLocationID`. 
+This adds `pickup_zone`, `pickup_borough`, `dropoff_zone`, and `dropoff_borough` 
+columns. A left join is used so that trips with unknown location IDs are retained 
+rather than dropped.
 
 ## 3. Streaming configuration
 
@@ -117,7 +136,9 @@ _Include row counts before and after restart._
 
 ## 6. Custom scenario
 
-_Explain and/or show how you solved the custom scenario from the GitHub issue._
+Our scenario is as follows: 
+
+_Run produce.py with --rate 1 and again with --rate 50. In REPORT.md, include a Spark UI screenshot for both runs and compare batch processing time, records per batch, and scheduling delay. Explain what happens when the producer is faster than the consumer._
 
 ## 7. How to run
 
