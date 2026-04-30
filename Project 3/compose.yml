@@ -149,6 +149,8 @@ services:
       - AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////opt/airflow/airflow.db
       - AIRFLOW__WEBSERVER__EXPOSE_CONFIG=True
+      - AIRFLOW_USER=${AIRFLOW_USER:-admin}
+      - AIRFLOW_PASSWORD=${AIRFLOW_PASSWORD:-admin}
       # Pass connection info so DAGs can reach other services
       - KAFKA_BOOTSTRAP=kafka:9092
       - CONNECT_URL=http://connect:8083
@@ -163,14 +165,8 @@ services:
     entrypoint: >
       /bin/bash -c "
         airflow db migrate;
-        airflow users create
-          --username ${AIRFLOW_USER:-admin}
-          --password ${AIRFLOW_PASSWORD:-admin}
-          --firstname Admin
-          --lastname User
-          --role Admin
-          --email admin@example.com 2>/dev/null || true;
-        exec airflow standalone
+        airflow users create --username $$AIRFLOW_USER --password $$AIRFLOW_PASSWORD --firstname Admin --lastname User --role Admin --email admin@example.com 2>/dev/null || true;
+      exec airflow standalone
       "
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
