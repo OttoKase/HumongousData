@@ -75,7 +75,7 @@ def main() -> None:
         description="Replay taxi trip parquet rows into Kafka.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--data",      default="data/yellow_tripdata_2025-01.parquet",
+    parser.add_argument("--data",      default="../data/yellow_tripdata_2025-01.parquet",
                         help="Path to the parquet file (relative to this script).")
     parser.add_argument("--topic",     default="taxi-trips",
                         help="Target Kafka topic.")
