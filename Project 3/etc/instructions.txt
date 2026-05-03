@@ -1,0 +1,53 @@
+# 1. Start stack
+docker compose up -d
+docker compose ps # i had to restart airflow bc it kept crashing
+
+# 2. Seed the DB
+docker exec jupyter python /home/jovyan/project/utils/seed.py
+
+# 3. Start simulator (keep running in a separate terminal)
+docker exec jupyter python /home/jovyan/project/utils/simulate.py
+
+# 4. Start taxi producer (keep running in another terminal)
+docker exec jupyter python /home/jovyan/project/utils/produce.py --loop
+
+# 5. Register the Debezium connector (added connector.json / connector.ps1)
+$body = @{
+    name = "cdc-connector"
+    config = @{
+        "connector.class" = "io.debezium.connector.postgresql.PostgresConnector"
+        "database.hostname" = "postgres"
+        "database.port" = "5432"
+        "database.user" = "cdc_user"
+        "database.password" = "admin"
+        "database.dbname" = "sourcedb"
+        "topic.prefix" = "dbserver1"
+        "table.include.list" = "public.customers,public.drivers"
+        "plugin.name" = "pgoutput"
+        "slot.name" = "debezium_slot"
+        "publication.name" = "dbz_publication"
+    }
+} | ConvertTo-Json -Depth 5
+
+Invoke-RestMethod `
+  -Uri "http://localhost:8083/connectors" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
+
+# 6. After a few minutes stop simulate.py
+docker exec jupyter pkill -f simulate.py, then wait ~15 seconds
+
+# 7. Trigger the DAG manually in Airflow UI 
+
+nb! in order for the http sensor to work I had to create a debezium_connect in airflow. 
+Admin → Connections → + (Add a new record)
+Fill in exactly:
+
+Connection Id: debezium_connect
+Connection Type: HTTP
+Host: connect
+Schema: http
+Port: 8083
+
+Leave everything else blank, hit Save, then re-trigger the DAG.
