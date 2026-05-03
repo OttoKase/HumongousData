@@ -705,7 +705,7 @@ with DAG(
     dag_id          = "project3_pipeline",
     default_args    = default_args,
     start_date      = datetime(2026, 4, 1),
-    schedule        = None,#"*/15 * * * *",
+    schedule        = "*/15 * * * *",
     catchup         = False,
     dagrun_timeout  = timedelta(hours=1),
     tags            = ["project3"],

@@ -12,18 +12,11 @@ This project implements a Change Data Capture (CDC) pipeline that captures mutat
 
 After running the DAG with `simulate.py` active, the validate task compares Silver Iceberg row counts against PostgreSQL using `REPEATABLE READ` isolation to get a consistent snapshot.
 
-<!-- ADD: paste the validate task log output here showing the PASS lines, e.g.:
-[validate] customers: PostgreSQL=XX  Silver=XX  delta=X  PASS
-[validate] drivers:   PostgreSQL=XX  Silver=XX  delta=X  PASS
--->
+![Validation DAG task log output](etc/images/validation_task_correctness.png)
 
 **Spot-check — 3 rows compared between Silver and PostgreSQL:**
 
-<!-- ADD: run these two queries and paste side by side:
-  Notebook: spark.sql("SELECT id, name, email, country FROM lakehouse.cdc.silver_customers ORDER BY id LIMIT 3").show()
-  Terminal: docker exec postgres psql -U cdc_user -d sourcedb -c "SELECT id, name, email, country FROM public.customers ORDER BY id LIMIT 3;"
-  Show that the rows match.
--->
+![Postgres vs Lakehouse data correctness](etc/images/lakehouse_postgres_match.png)
 
 ### 1.2 DELETEs are reflected in Silver
 
@@ -33,25 +26,12 @@ When a row is deleted in PostgreSQL, Debezium emits a CDC event with `op='d'`. T
 WHEN MATCHED AND s.op = 'd' THEN DELETE
 ```
 
-<!-- ADD: demonstrate this with a manual delete test:
-  1. Note a specific customer id that exists in Silver
-  2. Run: docker exec postgres psql -U cdc_user -d sourcedb -c "DELETE FROM public.customers WHERE id=X;"
-  3. Trigger the DAG
-  4. Show: spark.sql("SELECT * FROM lakehouse.cdc.silver_customers WHERE id=X").show()
-  5. Result should be empty
--->
-
 ### 1.3 Idempotency
 
 Running the DAG twice with no new changes produces the same Silver state. This is guaranteed because:
 
 - Bronze uses incremental Kafka offsets — on the second run, no new events are read so nothing is appended to Bronze.
 - The Silver MERGE is idempotent by design: re-applying the same events results in the same state since UPDATE with identical values is a no-op and INSERT is gated by `WHEN NOT MATCHED`.
-
-<!-- ADD: show two consecutive row counts:
-  Run 1: spark.sql("SELECT count(*) FROM lakehouse.cdc.silver_customers").show() → XX rows
-  Run 2 (no changes): same query → XX rows (identical)
--->
 
 ---
 
@@ -157,21 +137,15 @@ Running the DAG twice with no new changes produces the same Silver state. This i
 
 ### 2.2 Iceberg Snapshot History
 
-<!-- ADD: run in notebook and paste output:
-spark.sql("SELECT snapshot_id, committed_at, operation, summary FROM lakehouse.cdc.silver_customers.history ORDER BY committed_at").show(truncate=False)
+Example of iceberg snapshot history 
 
-You should see multiple rows — one per DAG run that triggered a MERGE.
--->
+![Iceberg history for silver customers](etc/images/iceberg_history.png)
 
 ### 2.3 Time Travel
 
 Iceberg allows querying Silver CDC at any historical snapshot using the snapshot ID from the history table above.
 
-<!-- ADD: pick a snapshot_id from the history output above (one before your latest MERGE) and run:
-spark.sql("SELECT count(*) FROM lakehouse.cdc.silver_customers VERSION AS OF <snapshot_id>").show()
-
-Compare with current count to show the table changed between snapshots.
--->
+![Time traveling to specific snapshot](etc/images/time_travel.png)
 
 ---
 
@@ -179,10 +153,7 @@ Compare with current count to show the table changed between snapshots.
 
 ### 3.1 DAG Graph
 
-<!-- ADD: paste a screenshot of the Airflow DAG graph view here.
-In GitHub markdown: ![DAG Graph](images/dag_graph.png)
-Save the screenshot to a folder called images/ in your repo.
--->
+![DAG Graph](etc/images/dag_graph.png)
 
 ### 3.2 Task Dependency Chain
 
@@ -203,7 +174,7 @@ connector_health
 
 ### 3.3 Scheduling Strategy
 
-The DAG is currently set to `schedule=None` (manual triggers) for development. For production the intended schedule is `*/15 * * * *` (every 15 minutes).
+For production the set schedule is `*/15 * * * *` (every 15 minutes).
 
 **Freshness SLA:** A 15-minute schedule means Silver CDC will lag PostgreSQL by at most 15 minutes — changes made in PostgreSQL will be reflected in Silver within one DAG run cycle. This is acceptable for fleet management analytics where near-real-time (not true real-time) freshness is sufficient.
 
@@ -215,17 +186,10 @@ If `connector_health` fails (Debezium is down), all downstream tasks are skipped
 
 The DAG has a `dagrun_timeout=timedelta(hours=1)` — if a run exceeds one hour it is marked failed, preventing stuck runs from blocking the next trigger.
 
-<!-- ADD: show one example of a failed task and recovery:
-1. Screenshot of a red task in the Airflow UI
-2. The log showing the error
-3. Screenshot after clearing and re-running showing it went green
--->
-
 ### 3.5 DAG Run History
 
-<!-- ADD: screenshot of the Airflow DAG runs page showing at least 3 consecutive successful runs (all green).
-In GitHub markdown: ![DAG Runs](images/dag_runs.png)
--->
+![DAG Runs](etc/images/dag_runs.png)
+
 
 ### 3.6 Backfill
 
@@ -239,28 +203,22 @@ The DAG has `catchup=False` which means Airflow will not backfill missed runs wh
 
 ### 4.1 Bronze → Silver → Gold correctness
 
-<!-- ADD: paste row counts:
-spark.sql("SELECT count(*) FROM lakehouse.taxi.bronze_trips").show()
-spark.sql("SELECT count(*) FROM lakehouse.taxi.silver_trips").show()
-spark.sql("SELECT count(*) FROM lakehouse.taxi.gold_demand_patterns").show()
-spark.sql("SELECT count(*) FROM lakehouse.taxi.gold_supply_demand_gap").show()
--->
+Taxi pipeline counts:
 
-<!-- ADD: show a sample of gold output:
-spark.sql("SELECT * FROM lakehouse.taxi.gold_demand_patterns ORDER BY avg_trip_count DESC LIMIT 5").show()
--->
+![Taxi pipeline](etc/images/taxi_pipeline_counts.png)
+
+Gold level output:
+![Gold output](etc/images/taxi_gold_output.png)
 
 ### 4.2 Improvements over Project 2
 
-<!-- ADD: describe what feedback you received on Project 2 and what you changed.
-Examples of common improvements:
-- Added zone name enrichment (joining taxi_zone_lookup)
-- Added derived columns (trip_duration_minutes, avg_speed_kmh)
-- Added stricter validation (speed range, duration range, RatecodeID whitelist)
-- Moved from standalone streaming job to Airflow-orchestrated batch
-- Added MERGE INTO for idempotent Silver writes instead of overwrite
--->
-
+* Moved from standalone streaming notebook to Airflow-orchestrated batch pipeline
+* Replaced continuous readStream with incremental batch reads using Kafka offset tracking stored in Iceberg
+* Added kafka_offset DESC as a tiebreaker in deduplication on top of ts_ms DESC
+* Added lower bound speed filter (avg_speed_kmh >= 2) alongside the existing upper bound
+* Added a second gold table (gold_supply_demand_gap) that joins taxi demand with CDC driver counts
+* Added task-level retries, DAG timeout, and connector health check that blocks all downstream tasks on failure
+* Added a validation task that compares Silver row counts against PostgreSQL using REPEATABLE READ isolation
 ---
 
 ## 5. Custom Scenario — Fleet Demand Analysis
@@ -275,55 +233,25 @@ For each pickup zone and hour of day, we compute the average and standard deviat
 - **Low demand:** `avg_trip_count <= city_avg - city_stddev`
 - **Normal:** everything in between
 
-<!-- ADD: show the classification distribution:
-spark.sql("SELECT demand_classification, count(*) FROM lakehouse.taxi.gold_demand_patterns GROUP BY demand_classification").show()
--->
-
-<!-- ADD: show peak vs off-peak hours per zone (top 5 high demand):
-spark.sql("SELECT pickup_zone, hour_of_day, avg_trip_count, demand_classification FROM lakehouse.taxi.gold_demand_patterns WHERE demand_classification='high demand' ORDER BY avg_trip_count DESC LIMIT 10").show()
--->
-
 ### 5.2 Key Analytical Queries
 
-**Which 3 zones have the most predictable demand (lowest stddev)?**
+Queries are also in etc/Peakhours-demand-forecasting-report-answers.ipynb
 
-<!-- ADD: run and paste output:
-spark.sql("""
-    SELECT pickup_zone, avg(stddev_trip_count) AS avg_stddev
-    FROM lakehouse.taxi.gold_demand_patterns
-    GROUP BY pickup_zone
-    ORDER BY avg_stddev ASC
-    LIMIT 3
-""").show()
--->
+**Which 3 zones have the most predictable demand (lowest stddev)? Example:**
 
-**At what hour does demand peak city-wide?**
+![Zones with the most predictable demand](etc/images/predictable_demand.png)
 
-<!-- ADD: run and paste output:
-spark.sql("""
-    SELECT hour_of_day, sum(avg_trip_count) AS total_avg_trips
-    FROM lakehouse.taxi.gold_demand_patterns
-    GROUP BY hour_of_day
-    ORDER BY total_avg_trips DESC
-    LIMIT 1
-""").show()
--->
+**At what hour does demand peak city-wide? Example:**
+
+![Zones with their total trips](etc/images/demand_per_hour.png)
 
 ### 5.3 gold_supply_demand_gap
 
 The supply-demand gap table cross-references taxi demand with the number of active drivers in `silver_drivers`. Driver count is distributed proportionally across zones based on each zone's share of citywide demand for that hour. Zones where `avg_trip_count > driver_share` are flagged as underserved.
 
-**Which zones are underserved?**
+**Which zones are underserved? Example:**
 
-<!-- ADD: run and paste output:
-spark.sql("""
-    SELECT pickup_zone, hour_of_day, avg_trip_count, drivers_available, demand_supply_gap
-    FROM lakehouse.taxi.gold_supply_demand_gap
-    WHERE is_underserved = true
-    ORDER BY demand_supply_gap DESC
-    LIMIT 10
-""").show()
--->
+![Underserved zones](etc/images/underserved_zones.png)
 
 ---
 
@@ -345,12 +273,6 @@ The Silver CDC MERGE works as follows:
 ## 7. Connector Configuration
 
 The Debezium PostgreSQL connector is registered via the Kafka Connect REST API. The configuration is saved in `connector.json` in the repository root.
-
-<!-- ADD: paste the curl command used to register the connector, e.g.:
-curl -X POST http://localhost:8083/connectors \
-  -H "Content-Type: application/json" \
-  -d @connector.json
--->
 
 ---
 
