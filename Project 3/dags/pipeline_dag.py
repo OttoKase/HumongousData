@@ -5,13 +5,20 @@ from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.http.sensors.http import HttpSensor
 
-
+def notify_failure(context):
+    task_id = context["task_instance"].task_id
+    dag_id = context["task_instance"].dag_id
+    log_url = context["task_instance"].log_url
+    logging.error(
+        f"[ALERT] Task failed: dag={dag_id} task={task_id} log={log_url}"
+    )
+    
 default_args = {
     "owner": "group-f",
     "retries": 2,
     "retry_delay": timedelta(minutes=1),
+    "on_failure_callback": notify_failure,
 }
-
 
 def get_spark_session():
     import os
@@ -96,7 +103,8 @@ def run_bronze_customers():
             after_name      STRING,
             after_email     STRING,
             after_country   STRING,
-            before_id       INT
+            before_id       INT,
+            source_lsn      BIGINT
         ) USING iceberg
     """)
 
@@ -124,6 +132,7 @@ def run_bronze_customers():
         F.get_json_object(F.col("value").cast("string"), "$.payload.after.email").alias("after_email"),
         F.get_json_object(F.col("value").cast("string"), "$.payload.after.country").alias("after_country"),
         F.get_json_object(F.col("value").cast("string"), "$.payload.before.id").cast("int").alias("before_id"),
+        F.get_json_object(F.col("value").cast("string"), "$.payload.source.lsn").cast("long").alias("source_lsn"),
     )
 
     bronze_df.writeTo("lakehouse.cdc.bronze_customers").append()
@@ -204,7 +213,8 @@ def run_bronze_drivers():
             after_name      STRING,
             after_email     STRING,
             after_country   STRING,
-            before_id       INT
+            before_id       INT,
+            source_lsn      BIGINT
         ) USING iceberg
     """)
 
@@ -232,6 +242,7 @@ def run_bronze_drivers():
         F.get_json_object(F.col("value").cast("string"), "$.payload.after.email").alias("after_email"),
         F.get_json_object(F.col("value").cast("string"), "$.payload.after.country").alias("after_country"),
         F.get_json_object(F.col("value").cast("string"), "$.payload.before.id").cast("int").alias("before_id"),
+        F.get_json_object(F.col("value").cast("string"), "$.payload.source.lsn").cast("long").alias("source_lsn")
     )
 
     bronze_df.writeTo("lakehouse.cdc.bronze_drivers").append()
@@ -691,12 +702,13 @@ def run_validate():
 
 
 with DAG(
-    dag_id="project3_pipeline",
-    default_args=default_args,
-    start_date=datetime(2026, 4, 1),
-    schedule="*/15 * * * *",
-    catchup=False,
-    tags=["project3"],
+    dag_id          = "project3_pipeline",
+    default_args    = default_args,
+    start_date      = datetime(2026, 4, 1),
+    schedule        = None,#"*/15 * * * *",
+    catchup         = False,
+    dagrun_timeout  = timedelta(hours=1),
+    tags            = ["project3"],
 ) as dag:
 
     health_check = HttpSensor(
@@ -757,9 +769,13 @@ with DAG(
 
     # Path A: CDC
     bronze_customers >> silver_customers
-    bronze_drivers   >> silver_drivers
+    bronze_drivers >> silver_drivers
 
     # Path B: Taxi
-    bronze_taxi >> silver_taxi >> gold_taxi
+    bronze_taxi >> silver_taxi
 
-    [silver_customers, silver_drivers, gold_taxi] >> validate
+    # Gold depends on both paths
+    [silver_taxi, silver_drivers] >> gold_taxi
+
+    # Validate depends on everything
+    [silver_customers, gold_taxi] >> validate

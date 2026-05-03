@@ -1,319 +1,373 @@
-# Project 3 — CDC + Orchestrated Lakehouse Pipeline
+# Project 3 Report — Group F
 
-Build a CDC pipeline that captures changes from a PostgreSQL database using Debezium,
-lands them in an Apache Iceberg lakehouse (bronze → silver), **and** continues the
-streaming taxi pipeline from Project 2 — now orchestrated end-to-end with Apache Airflow.
+## Pipeline Overview
 
-Your group's custom scenario is (or will be :-)) described in your repository's GitHub issue.
+This project implements a Change Data Capture (CDC) pipeline that captures mutations from a PostgreSQL source using Debezium, streams change events through Kafka, and materialises the current state into an Apache Iceberg lakehouse. A taxi streaming pipeline (from Project 2) runs in parallel. Both paths are orchestrated by a single Apache Airflow DAG.
 
 ---
 
-## What's in this template
+## 1. CDC Correctness
 
-| Path | Description |
-|------|-------------|
-| `compose.yml` | Kafka, MinIO, Iceberg REST catalog, PostgreSQL, Kafka Connect (Debezium), Airflow, Jupyter/PySpark |
-| `produce.py` | Replays taxi parquet rows as JSON into the `taxi-trips` Kafka topic (same as Project 2) |
-| `seed.py` | Creates source tables in PostgreSQL and inserts initial data |
-| `simulate.py` | Continuously makes changes (INSERT, UPDATE, DELETE) to PostgreSQL, simulating a live OLTP workload |
-| `dags/` | Place your Airflow DAG file(s) here — auto-loaded by the Airflow scheduler |
-| `REPORT.md` | Template for the report you need to hand in |
-| `.env.example` | Template for credentials — copy to `.env` and fill in values |
-| `data/` | **Not in git.** Place the same taxi parquet files from Project 1 & 2 here |
+### 1.1 Silver mirrors PostgreSQL
 
-The `data/` directory is git-ignored. You will use the same files as in previous projects:
+After running the DAG with `simulate.py` active, the validate task compares Silver Iceberg row counts against PostgreSQL using `REPEATABLE READ` isolation to get a consistent snapshot.
 
-| File | Description |
-|------|-------------|
-| `data/yellow_tripdata_2025-01.parquet` | NYC Yellow Taxi trips — January 2025 |
-| `data/yellow_tripdata_2025-02.parquet` | NYC Yellow Taxi trips — February 2025 |
-| `data/taxi_zone_lookup.parquet` | Pickup/dropoff zone names |
+<!-- ADD: paste the validate task log output here showing the PASS lines, e.g.:
+[validate] customers: PostgreSQL=XX  Silver=XX  delta=X  PASS
+[validate] drivers:   PostgreSQL=XX  Silver=XX  delta=X  PASS
+-->
+
+**Spot-check — 3 rows compared between Silver and PostgreSQL:**
+
+<!-- ADD: run these two queries and paste side by side:
+  Notebook: spark.sql("SELECT id, name, email, country FROM lakehouse.cdc.silver_customers ORDER BY id LIMIT 3").show()
+  Terminal: docker exec postgres psql -U cdc_user -d sourcedb -c "SELECT id, name, email, country FROM public.customers ORDER BY id LIMIT 3;"
+  Show that the rows match.
+-->
+
+### 1.2 DELETEs are reflected in Silver
+
+When a row is deleted in PostgreSQL, Debezium emits a CDC event with `op='d'`. The Bronze layer appends this event as-is. The Silver MERGE then deletes the corresponding row:
+
+```sql
+WHEN MATCHED AND s.op = 'd' THEN DELETE
+```
+
+<!-- ADD: demonstrate this with a manual delete test:
+  1. Note a specific customer id that exists in Silver
+  2. Run: docker exec postgres psql -U cdc_user -d sourcedb -c "DELETE FROM public.customers WHERE id=X;"
+  3. Trigger the DAG
+  4. Show: spark.sql("SELECT * FROM lakehouse.cdc.silver_customers WHERE id=X").show()
+  5. Result should be empty
+-->
+
+### 1.3 Idempotency
+
+Running the DAG twice with no new changes produces the same Silver state. This is guaranteed because:
+
+- Bronze uses incremental Kafka offsets — on the second run, no new events are read so nothing is appended to Bronze.
+- The Silver MERGE is idempotent by design: re-applying the same events results in the same state since UPDATE with identical values is a no-op and INSERT is gated by `WHEN NOT MATCHED`.
+
+<!-- ADD: show two consecutive row counts:
+  Run 1: spark.sql("SELECT count(*) FROM lakehouse.cdc.silver_customers").show() → XX rows
+  Run 2 (no changes): same query → XX rows (identical)
+-->
 
 ---
 
-## Setup
+## 2. Lakehouse Design
 
-### 1. Configure credentials
+### 2.1 Table Schemas
 
-```bash
-cp .env.example .env
-# Edit .env — change all default passwords before starting the stack
-```
+#### Bronze CDC (`lakehouse.cdc.bronze_customers`, `lakehouse.cdc.bronze_drivers`)
 
-The `.env` file is git-ignored and never committed.
-You need to change all the default secrets, and provide them in `REPORT.md` section 8 in your project submission.
+| Column | Type | Description |
+|---|---|---|
+| topic | STRING | Kafka topic name |
+| kafka_partition | INT | Kafka partition |
+| kafka_offset | BIGINT | Kafka offset (used for incremental reads) |
+| kafka_timestamp | TIMESTAMP | Kafka message timestamp |
+| op | STRING | CDC operation: c=create, u=update, d=delete, r=read |
+| ts_ms | BIGINT | PostgreSQL event timestamp in milliseconds |
+| source_lsn | BIGINT | PostgreSQL WAL Log Sequence Number |
+| after_id | INT | Row ID after the change |
+| after_name | STRING | Name after the change |
+| after_email | STRING | Email after the change |
+| after_country | STRING | Country after the change |
+| before_id | INT | Row ID before the change (populated on deletes) |
 
-### 2. Place the data files
+**Design rationale:** Bronze is append-only and never modified. Every CDC event is stored raw including all before/after fields and Kafka metadata. This preserves the full audit trail and allows replaying history.
 
-Same taxi data as Project 2:
+#### Silver CDC (`lakehouse.cdc.silver_customers`, `lakehouse.cdc.silver_drivers`)
 
-```
-project_3/
-└── data/
-    ├── yellow_tripdata_2025-01.parquet
-    ├── yellow_tripdata_2025-02.parquet
-    └── taxi_zone_lookup.parquet
-```
+| Column | Type | Description |
+|---|---|---|
+| id | INT | Primary key |
+| name | STRING | Current name |
+| email | STRING | Current email |
+| country | STRING | Current country |
+| last_updated_ms | BIGINT | Timestamp of the last change |
 
-### 3. Start the stack
+**Design rationale:** Silver mirrors the current state of PostgreSQL. Only one row per entity exists. Deleted rows are absent. This is the queryable source-of-truth layer for downstream consumers.
 
-```bash
-docker compose up -d
-```
+#### Bronze Taxi (`lakehouse.taxi.bronze_trips`)
 
-Allow ~30 seconds for all services to become ready. PostgreSQL, Kafka, Kafka Connect,
-MinIO, Iceberg catalog, Airflow, and Jupyter all need to start in order.
+| Column | Type | Description |
+|---|---|---|
+| kafka_partition | INT | Kafka partition |
+| kafka_offset | BIGINT | Kafka offset |
+| kafka_timestamp | TIMESTAMP | Kafka ingest time |
+| VendorID | INT | Taxi vendor |
+| tpep_pickup_datetime | STRING | Raw pickup time string |
+| tpep_dropoff_datetime | STRING | Raw dropoff time string |
+| passenger_count | DOUBLE | Raw passenger count |
+| trip_distance | DOUBLE | Trip distance in miles |
+| fare_amount | DOUBLE | Base fare |
+| total_amount | DOUBLE | Total charge |
+| PULocationID | INT | Pickup location ID |
+| DOLocationID | INT | Dropoff location ID |
+| ... | ... | Other raw fields |
 
-### 4. Verify services
+**Design rationale:** Bronze stores raw Kafka events with minimal transformation. Types are kept as-is from JSON parsing. Invalid rows are kept — filtering happens in Silver.
 
-```bash
-docker ps
-```
+#### Silver Taxi (`lakehouse.taxi.silver_trips`)
 
-You should see these services running:
+| Column | Type | Description |
+|---|---|---|
+| VendorID | INT | Taxi vendor |
+| tpep_pickup_datetime | TIMESTAMP | Parsed pickup timestamp |
+| tpep_dropoff_datetime | TIMESTAMP | Parsed dropoff timestamp |
+| passenger_count | INT | Cast and validated |
+| trip_distance | DOUBLE | Validated (>= 0) |
+| fare_amount | DOUBLE | Validated |
+| trip_duration_minutes | INT | Derived: dropoff - pickup |
+| avg_speed_kmh | DOUBLE | Derived: distance / duration |
+| pickup_zone | STRING | Enriched from zone lookup |
+| pickup_borough | STRING | Enriched from zone lookup |
+| dropoff_zone | STRING | Enriched from zone lookup |
+| dropoff_borough | STRING | Enriched from zone lookup |
+| ... | ... | Other cleaned fields |
 
-| Container | Role |
-|-----------|------|
-| `kafka` | Message broker (KRaft, no ZooKeeper) |
-| `postgres` | OLTP source database for CDC |
-| `connect` | Kafka Connect with Debezium PostgreSQL connector |
-| `minio` | S3-compatible object storage for Iceberg |
-| `minio_init` | One-shot bucket creation (exited is OK) |
-| `iceberg-rest` | Iceberg REST catalog |
-| `airflow-webserver` | Airflow UI |
-| `airflow-scheduler` | Airflow DAG scheduler |
-| `jupyter` | Jupyter + PySpark |
+**Design rationale:** Silver applies type casting, null filtering, range validation (speed, duration, passenger count), deduplication, and zone name enrichment. Invalid trips are dropped. This layer is safe for analytics.
 
-### 5. Seed the PostgreSQL source
+#### Gold Taxi (`lakehouse.taxi.gold_demand_patterns`, `lakehouse.taxi.gold_supply_demand_gap`)
 
-```bash
-docker exec jupyter python /home/jovyan/project/seed.py
-```
+**gold_demand_patterns:**
 
-This creates the source tables and inserts initial data. Verify in the Jupyter notebook:
+| Column | Type | Description |
+|---|---|---|
+| pickup_zone | STRING | Zone name |
+| hour_of_day | INT | Hour (0-23) |
+| avg_trip_count | DOUBLE | Average trips across all days |
+| stddev_trip_count | DOUBLE | Standard deviation of daily trip counts |
+| demand_classification | STRING | high demand / normal / low demand |
 
-```python
-pg_execute("SELECT * FROM customers ORDER BY id;", fetch=True)
-```
+**gold_supply_demand_gap:**
 
-### 6. Start the taxi producer (same as Project 2)
+| Column | Type | Description |
+|---|---|---|
+| pickup_zone | STRING | Zone name |
+| hour_of_day | INT | Hour (0-23) |
+| avg_trip_count | DOUBLE | Average demand |
+| drivers_available | DOUBLE | Estimated driver share for this zone/hour |
+| demand_supply_gap | DOUBLE | avg_trip_count - drivers_available |
+| is_underserved | BOOLEAN | True if demand exceeds driver share |
 
-```bash
-docker exec jupyter python /home/jovyan/project/produce.py --loop
-```
+**Design rationale:** Gold aggregates Silver data into business-level insights. Raw trip records are collapsed into zone+hour statistics. Two tables serve different analytical needs: demand patterns for fleet planning, supply-demand gap for identifying underserved zones.
 
-### 7. Start the change simulator
+### 2.2 Iceberg Snapshot History
 
-```bash
-docker exec jupyter python /home/jovyan/project/simulate.py
-```
+<!-- ADD: run in notebook and paste output:
+spark.sql("SELECT snapshot_id, committed_at, operation, summary FROM lakehouse.cdc.silver_customers.history ORDER BY committed_at").show(truncate=False)
 
-This continuously makes random inserts, updates, and deletes to the PostgreSQL
-source tables, simulating a live application.
+You should see multiple rows — one per DAG run that triggered a MERGE.
+-->
 
-### 8. Open services
+### 2.3 Time Travel
 
-| Service | URL | Credentials |
-|---------|-----|-------------|
-| Jupyter | http://localhost:8888 | token: `JUPYTER_TOKEN` from `.env` |
-| Airflow | http://localhost:8080 | `AIRFLOW_USER` / `AIRFLOW_PASSWORD` from `.env` |
-| Spark UI | http://localhost:4040 | — |
-| MinIO Console | http://localhost:9001 | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` from `.env` |
-| Kafka Connect API | http://localhost:8083 | — |
-| Iceberg REST API | http://localhost:8181/v1/namespaces | — |
+Iceberg allows querying Silver CDC at any historical snapshot using the snapshot ID from the history table above.
 
-### 9. Stop the stack
+<!-- ADD: pick a snapshot_id from the history output above (one before your latest MERGE) and run:
+spark.sql("SELECT count(*) FROM lakehouse.cdc.silver_customers VERSION AS OF <snapshot_id>").show()
 
-```bash
-docker compose down          # keeps MinIO data (named volume)
-docker compose down -v       # also deletes stored Iceberg tables
-```
-
----
-
-## What to build
-
-Your pipeline has **two data paths**, both orchestrated by a single Airflow DAG:
-
-```
-┌─ Path A: CDC ──────────────────────────────────────────────────┐
-│  PostgreSQL → Debezium → Kafka → Bronze (CDC) → Silver (MERGE) │
-└────────────────────────────────────────────────────────────────┘
-
-┌─ Path B: Streaming (from Project 2) ──────────────────────────┐
-│  Taxi producer → Kafka → Bronze (taxi) → Silver → Gold         │
-└────────────────────────────────────────────────────────────────┘
-
-┌─ Airflow DAG orchestrates both paths ─────────────────────────┐
-│  health_check → [bronze_cdc, bronze_taxi] → [silver_cdc,      │
-│  silver_taxi] → gold_taxi → validation                         │
-└────────────────────────────────────────────────────────────────┘
-```
-
-### Path A — CDC Pipeline (new)
-
-#### 1. Debezium CDC connector
-
-- Register a Debezium PostgreSQL connector via the Kafka Connect REST API.
-- Configure it to capture changes from the source tables using log-based CDC (WAL).
-- Verify that CDC events appear in Kafka topics (`dbserver1.public.<table>`).
-- Handle the initial snapshot — document which snapshot mode you chose and why.
-
-#### 2. Bronze CDC layer (raw CDC events)
-
-- Read CDC events from Kafka using Spark.
-- Parse the Debezium envelope correctly (extract from `$.payload.*` — the `schema + payload` wrapper).
-- Write all events as-is to a bronze Iceberg table. Append-only — never update or delete rows in bronze.
-- Include Kafka metadata (offset, partition, timestamp) alongside CDC fields (op, before, after, ts_ms).
-- Handle tombstone messages (null-value records from deletes).
-
-#### 3. Silver CDC layer (current-state mirror)
-
-- Read from the bronze CDC table incrementally (only new events since last run).
-- Deduplicate: keep only the latest event per primary key (`ROW_NUMBER` over `ts_ms DESC`).
-- Apply `MERGE INTO` to the silver Iceberg table:
-  - `op = 'd'` → DELETE the row
-  - `op IN ('u', 'c', 'r')` → UPDATE if exists, INSERT if not
-- After MERGE, silver should mirror the current state of the PostgreSQL source.
-- Document your MERGE logic and explain why it is idempotent.
-
-### Path B — Streaming Taxi Pipeline (improved from Project 2)
-
-#### 4. Bronze → Silver → Gold for taxi data
-
-- Same medallion pipeline as Project 2: raw Kafka events → cleaned/enriched → aggregated.
-- Improve upon your Project 2 implementation based on feedback received.
-- **New requirement:** this pipeline must now be triggered by Airflow, not run as a standalone streaming job.
-
-### Orchestration (ties both paths together)
-
-#### 5. Airflow DAG
-
-- Create an Airflow DAG that orchestrates **both pipelines** end-to-end.
-- The DAG should include at minimum:
-  - A **health-check task** to verify the Debezium connector is running (REST API call).
-  - **Bronze ingestion tasks** for both CDC and taxi data.
-  - **Silver tasks** for both pipelines (MERGE for CDC, clean/enrich for taxi).
-  - A **gold task** for the taxi aggregation.
-  - A **validation task** that confirms silver CDC matches PostgreSQL source.
-- **Scheduling:** Configure a reasonable schedule interval. Justify your choice — what freshness SLA does it support?
-- **Retries and failure handling:** Configure task-level retries. If the MERGE task fails, downstream tasks should not run. If the connector health check fails, the DAG should alert and stop.
-- **SLAs:** Set a time limit on the DAG. Configure at least one failure notification mechanism.
-- **Idempotent re-runs:** Running the DAG twice for the same interval must produce the same result. This is critical for backfill scenarios.
-
-### Bonus (not required)
-
-#### 6. Schema evolution
-
-- Add a column to the PostgreSQL source table while the pipeline is running.
-- Show that Debezium detects the change, bronze stores both old and new events, silver evolves via `ALTER TABLE ADD COLUMN`.
+Compare with current count to show the table changed between snapshots.
+-->
 
 ---
 
-## What is graded
+## 3. Orchestration Design
 
-Create a report (`REPORT.md`, max ~3 pages). Use the template provided.
+### 3.1 DAG Graph
 
-### 1. CDC correctness
+<!-- ADD: paste a screenshot of the Airflow DAG graph view here.
+In GitHub markdown: ![DAG Graph](images/dag_graph.png)
+Save the screenshot to a folder called images/ in your repo.
+-->
 
-- Show that silver mirrors PostgreSQL (compare row counts and spot-check specific rows).
-- Show that deletes in PostgreSQL are reflected in silver.
-- Show that the pipeline is idempotent — running the DAG twice with no new changes produces the same state.
+### 3.2 Task Dependency Chain
 
-### 2. Lakehouse design
+```
+connector_health
+    ├── bronze_customers → silver_customers ──────────────────┐
+    ├── bronze_drivers   → silver_drivers ──→ gold_taxi ──────→ validate
+    └── bronze_taxi      → silver_taxi    ──┘
+```
 
-- Describe the schema of bronze CDC, silver CDC, bronze taxi, silver taxi, and gold tables.
-- Show Iceberg snapshot history for the silver CDC table.
-- Explain how you would roll back a bad MERGE using Iceberg time travel.
+**Rationale:**
+- `connector_health` runs first — if Debezium is not running, the CDC path cannot produce correct data so all downstream tasks are blocked.
+- `bronze_customers` and `bronze_drivers` run in parallel after the health check — they read from independent Kafka topics.
+- `bronze_taxi` also runs in parallel — it is fully independent of the CDC path.
+- `silver_customers` and `silver_drivers` each wait for their respective bronze tasks.
+- `gold_taxi` waits for both `silver_taxi` and `silver_drivers` because the supply-demand gap table joins driver counts from Silver CDC with taxi demand data.
+- `validate` runs last after both CDC silver tables and gold are complete.
 
-### 3. Orchestration design
+### 3.3 Scheduling Strategy
 
-- Include a screenshot of your Airflow DAG (graph view).
-- Explain the task dependency chain and why tasks are in this order.
-- Describe your scheduling strategy and what freshness SLA it supports.
-- Describe retry and failure handling. Show at least one example of a failed task and how the DAG handled it.
-- Show DAG run history — at least 3 successful consecutive runs.
-- Explain how backfill works for your DAG.
+The DAG is currently set to `schedule=None` (manual triggers) for development. For production the intended schedule is `*/15 * * * *` (every 15 minutes).
 
-### 4. Streaming pipeline (taxi)
+**Freshness SLA:** A 15-minute schedule means Silver CDC will lag PostgreSQL by at most 15 minutes — changes made in PostgreSQL will be reflected in Silver within one DAG run cycle. This is acceptable for fleet management analytics where near-real-time (not true real-time) freshness is sufficient.
 
-- Show that the taxi bronze/silver/gold pipeline works correctly (same criteria as Project 2).
-- Show improvements over Project 2 based on feedback.
+### 3.4 Retry and Failure Handling
 
-### 5. Custom scenario
+Tasks are configured with `retries=2` and `retry_delay=timedelta(minutes=1)`. If a task fails it will be retried twice before being marked as failed. An `on_failure_callback` logs a structured `[ALERT]` message to the task log on final failure.
 
-- Explain and/or show how you solved the custom scenario from the GitHub issue.
+If `connector_health` fails (Debezium is down), all downstream tasks are skipped automatically because they depend on it in the DAG graph.
 
----
+The DAG has a `dagrun_timeout=timedelta(hours=1)` — if a run exceeds one hour it is marked failed, preventing stuck runs from blocking the next trigger.
 
-## Deliverables
+<!-- ADD: show one example of a failed task and recovery:
+1. Screenshot of a red task in the Airflow UI
+2. The log showing the error
+3. Screenshot after clearing and re-running showing it went green
+-->
 
-GitHub repository containing:
+### 3.5 DAG Run History
 
-- **Code:** Spark notebooks or Python scripts, Airflow DAG file(s), connector configuration, seed/simulate scripts. Must run end-to-end.
-- **Report** (`REPORT.md`).
-- The Iceberg tables must be queryable after running the pipeline.
-- The Airflow DAG must be visible and runnable in the Airflow UI.
+<!-- ADD: screenshot of the Airflow DAG runs page showing at least 3 consecutive successful runs (all green).
+In GitHub markdown: ![DAG Runs](images/dag_runs.png)
+-->
 
-## How it will be checked
+### 3.6 Backfill
 
-The grading process:
-
-1. Clone your repository.
-2. Run `docker compose up`, `seed.py`, `simulate.py`, and `produce.py`.
-3. Trigger the Airflow DAG or wait for the scheduled run.
-4. Verify bronze CDC contains raw CDC events, silver CDC mirrors PostgreSQL.
-5. Verify bronze/silver/gold taxi tables contain correct data.
-6. Stop the simulator, make a manual change in PostgreSQL, trigger the DAG, verify silver reflects the change.
-7. Check Airflow for DAG run history, task logs, and retry behavior.
-8. Manually fail a task (e.g., stop Kafka Connect) and verify the DAG handles it correctly.
-
-**Share your GitHub repository link in Moodle under Module 3 as soon as possible so custom scenarios can be assigned.**
+The DAG has `catchup=False` which means Airflow will not backfill missed runs when the DAG is unpaused. Since `schedule=None` is used during development, backfill is not applicable. If the schedule were re-enabled, re-running for the same interval produces the same result because:
+- Bronze reads are incremental (offset-tracked) — no duplicate appends
+- Silver MERGE is idempotent — same events produce same state
 
 ---
 
-## Grading checklist (self-review before submission)
+## 4. Taxi Pipeline
 
-- [ ] `docker compose up` + seed + simulate + produce + run DAG end-to-end without errors
-- [ ] Debezium connector is registered and RUNNING
-- [ ] Bronze CDC table contains raw Debezium events with correct op, before, after fields
-- [ ] Silver CDC table matches PostgreSQL source (row count + spot check)
-- [ ] Deletes in PostgreSQL are reflected in silver CDC
-- [ ] Running the DAG twice produces the same silver state (idempotent)
-- [ ] Taxi bronze/silver/gold tables are correct (improved from Project 2)
-- [ ] Airflow DAG is visible in the UI with correct task dependencies
-- [ ] At least 3 successful DAG runs shown
-- [ ] Retry/failure handling configured and documented
-- [ ] Iceberg snapshot history shown in REPORT.md
-- [ ] Custom scenario implemented and documented
-- [ ] REPORT.md answers all required sections
-- [ ] `.env` values provided in REPORT.md section 8
+### 4.1 Bronze → Silver → Gold correctness
+
+<!-- ADD: paste row counts:
+spark.sql("SELECT count(*) FROM lakehouse.taxi.bronze_trips").show()
+spark.sql("SELECT count(*) FROM lakehouse.taxi.silver_trips").show()
+spark.sql("SELECT count(*) FROM lakehouse.taxi.gold_demand_patterns").show()
+spark.sql("SELECT count(*) FROM lakehouse.taxi.gold_supply_demand_gap").show()
+-->
+
+<!-- ADD: show a sample of gold output:
+spark.sql("SELECT * FROM lakehouse.taxi.gold_demand_patterns ORDER BY avg_trip_count DESC LIMIT 5").show()
+-->
+
+### 4.2 Improvements over Project 2
+
+<!-- ADD: describe what feedback you received on Project 2 and what you changed.
+Examples of common improvements:
+- Added zone name enrichment (joining taxi_zone_lookup)
+- Added derived columns (trip_duration_minutes, avg_speed_kmh)
+- Added stricter validation (speed range, duration range, RatecodeID whitelist)
+- Moved from standalone streaming job to Airflow-orchestrated batch
+- Added MERGE INTO for idempotent Silver writes instead of overwrite
+-->
 
 ---
 
-## Troubleshooting
+## 5. Custom Scenario — Fleet Demand Analysis
 
-**Debezium connector FAILED**
-Check `docker compose logs connect` for errors. Common causes: PostgreSQL not reachable,
-wrong credentials, `wal_level` not set to `logical`, replication slot already exists from
-a previous run.
+Our custom scenario (GitHub issue) requires building a gold layer that helps a hypothetical fleet management team understand trip demand patterns and identify underserved zones.
 
-**CDC events have all NULL fields**
-You are parsing from the top level instead of `$.payload.*`. Debezium wraps events in a
-`{"schema": {...}, "payload": {...}}` envelope. Extract from `$.payload.op`,
-`$.payload.after.id`, etc.
+### 5.1 gold_demand_patterns
 
-**PostgreSQL replication slot growing**
-If the Debezium connector is stopped for a long time, PostgreSQL retains WAL segments.
-Check with: `SELECT slot_name, pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) FROM pg_replication_slots;`
+For each pickup zone and hour of day, we compute the average and standard deviation of daily trip counts across all days in the dataset. Zones/hours are then classified:
 
-**Airflow DAG not appearing**
-Place your DAG `.py` file in the `dags/` directory. The scheduler scans this folder.
-Check `docker compose logs airflow-scheduler` for import errors.
+- **High demand:** `avg_trip_count >= city_avg + city_stddev`
+- **Low demand:** `avg_trip_count <= city_avg - city_stddev`
+- **Normal:** everything in between
 
-**`Failed to find data source: kafka`**
-Check `PYSPARK_SUBMIT_ARGS` in `compose.yml` — versions must match your Spark version.
+<!-- ADD: show the classification distribution:
+spark.sql("SELECT demand_classification, count(*) FROM lakehouse.taxi.gold_demand_patterns GROUP BY demand_classification").show()
+-->
 
-**Iceberg table not found after restart**
-Tables are stored in MinIO (persistent named volume). They survive container restarts
-unless you run `docker compose down -v`.
+<!-- ADD: show peak vs off-peak hours per zone (top 5 high demand):
+spark.sql("SELECT pickup_zone, hour_of_day, avg_trip_count, demand_classification FROM lakehouse.taxi.gold_demand_patterns WHERE demand_classification='high demand' ORDER BY avg_trip_count DESC LIMIT 10").show()
+-->
+
+### 5.2 Key Analytical Queries
+
+**Which 3 zones have the most predictable demand (lowest stddev)?**
+
+<!-- ADD: run and paste output:
+spark.sql("""
+    SELECT pickup_zone, avg(stddev_trip_count) AS avg_stddev
+    FROM lakehouse.taxi.gold_demand_patterns
+    GROUP BY pickup_zone
+    ORDER BY avg_stddev ASC
+    LIMIT 3
+""").show()
+-->
+
+**At what hour does demand peak city-wide?**
+
+<!-- ADD: run and paste output:
+spark.sql("""
+    SELECT hour_of_day, sum(avg_trip_count) AS total_avg_trips
+    FROM lakehouse.taxi.gold_demand_patterns
+    GROUP BY hour_of_day
+    ORDER BY total_avg_trips DESC
+    LIMIT 1
+""").show()
+-->
+
+### 5.3 gold_supply_demand_gap
+
+The supply-demand gap table cross-references taxi demand with the number of active drivers in `silver_drivers`. Driver count is distributed proportionally across zones based on each zone's share of citywide demand for that hour. Zones where `avg_trip_count > driver_share` are flagged as underserved.
+
+**Which zones are underserved?**
+
+<!-- ADD: run and paste output:
+spark.sql("""
+    SELECT pickup_zone, hour_of_day, avg_trip_count, drivers_available, demand_supply_gap
+    FROM lakehouse.taxi.gold_supply_demand_gap
+    WHERE is_underserved = true
+    ORDER BY demand_supply_gap DESC
+    LIMIT 10
+""").show()
+-->
+
+---
+
+## 6. MERGE Logic and Idempotency
+
+The Silver CDC MERGE works as follows:
+
+1. All bronze events are deduplicated by primary key, keeping only the latest event per entity (ordered by `ts_ms DESC`, ties broken by `kafka_offset DESC`).
+2. The deduplicated batch is written to a staging Iceberg table.
+3. A `MERGE INTO` is applied from staging to Silver:
+   - If the entity exists in Silver and the latest op is `'d'` → DELETE
+   - If the entity exists in Silver and the latest op is `'c'`, `'u'`, or `'r'` → UPDATE
+   - If the entity does not exist in Silver and the latest op is not `'d'` → INSERT
+
+**Why it is idempotent:** Re-running the MERGE with the same staging data produces the same result. UPDATEs with identical values are no-ops at the data level. INSERTs are gated by `WHEN NOT MATCHED` so duplicates cannot be inserted. DELETEs on already-absent rows match nothing and are skipped. The incremental offset tracking ensures the same bronze events are never re-appended, so the staging batch is always identical for the same input state.
+
+---
+
+## 7. Connector Configuration
+
+The Debezium PostgreSQL connector is registered via the Kafka Connect REST API. The configuration is saved in `connector.json` in the repository root.
+
+<!-- ADD: paste the curl command used to register the connector, e.g.:
+curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d @connector.json
+-->
+
+---
+
+## 8. Environment Setup
+
+Copy `.env.example` to `.env` and set the following values:
+
+| Variable | Description | Example |
+|---|---|---|
+| MINIO_ROOT_USER | MinIO admin username | admin |
+| MINIO_ROOT_PASSWORD | MinIO admin password | admin123 |
+| AWS_ACCESS_KEY_ID | Must match MINIO_ROOT_USER | admin |
+| AWS_SECRET_ACCESS_KEY | Must match MINIO_ROOT_PASSWORD | admin123 |
+| PG_USER | PostgreSQL CDC user | cdc_user |
+| PG_PASSWORD | PostgreSQL CDC password | admin |
+| AIRFLOW_USER | Airflow UI username | admin |
+| AIRFLOW_PASSWORD | Airflow UI password | admin |
+| JUPYTER_TOKEN | Jupyter notebook token | admin |
+
+**Important:** `AWS_ACCESS_KEY_ID` must equal `MINIO_ROOT_USER` and `AWS_SECRET_ACCESS_KEY` must equal `MINIO_ROOT_PASSWORD`. Mismatched values will cause S3 signature errors when Spark writes to MinIO.
