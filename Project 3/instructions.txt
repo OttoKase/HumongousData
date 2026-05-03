@@ -11,11 +11,32 @@ docker exec jupyter python /home/jovyan/project/utils/simulate.py
 # 4. Start taxi producer (keep running in another terminal)
 docker exec jupyter python /home/jovyan/project/utils/produce.py --loop
 
-# 5. Register the Debezium connector (if not already done)
-# the command that's in out jupyter notebook
+# 5. Register the Debezium connector 
+$body = @{
+    name = "cdc-connector"
+    config = @{
+        "connector.class" = "io.debezium.connector.postgresql.PostgresConnector"
+        "database.hostname" = "postgres"
+        "database.port" = "5432"
+        "database.user" = "cdc_user"
+        "database.password" = "admin"
+        "database.dbname" = "sourcedb"
+        "topic.prefix" = "dbserver1"
+        "table.include.list" = "public.customers,public.drivers"
+        "plugin.name" = "pgoutput"
+        "slot.name" = "debezium_slot"
+        "publication.name" = "dbz_publication"
+    }
+} | ConvertTo-Json -Depth 5
+
+Invoke-RestMethod `
+  -Uri "http://localhost:8083/connectors" `
+  -Method Post `
+  -ContentType "application/json" `
+  -Body $body
 
 # 6. After a few minutes stop simulate.py
-# Ctrl+C in its terminal, then wait ~15 seconds
+docker exec jupyter pkill -f simulate.py, then wait ~15 seconds
 
 # 7. Trigger the DAG manually in Airflow UI 
 

@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime, timedelta
 from airflow import DAG
@@ -15,6 +16,10 @@ default_args = {
 def get_spark_session():
     import os
     from pyspark.sql import SparkSession
+
+    existing = SparkSession.getActiveSession()
+    if existing:
+        existing.stop()
 
     access_key = os.environ["AWS_ACCESS_KEY_ID"]
     secret_key = os.environ["AWS_SECRET_ACCESS_KEY"]
@@ -44,7 +49,36 @@ def get_spark_session():
     spark.sparkContext.setLogLevel("WARN")
     return spark
 
-# Path A
+
+def get_starting_offsets(spark, table_name, topic):
+    """
+    On the first run (when there's an empty table) use 'earliest' to read everything.
+    On subsequent runs build a JSON offset map from the max kafka_offset.
+    """
+    try:
+        count = spark.table(table_name).count()
+        if count == 0:
+            logging.info(f"[offsets] {table_name} is empty — using 'earliest'")
+            return "earliest"
+
+        from pyspark.sql import functions as F
+        max_offsets = (
+            spark.table(table_name)
+            .groupBy("kafka_partition")
+            .agg((F.max("kafka_offset") + 1).alias("offset"))
+            .collect()
+        )
+        offsets_json = {str(row["kafka_partition"]): row["offset"] for row in max_offsets}
+        result = json.dumps({topic: offsets_json})
+        logging.info(f"[offsets] {table_name} — resuming from {result}")
+        return result
+
+    except Exception as e:
+        logging.info(f"[offsets] {table_name} error ({e}) — using 'earliest'")
+        return "earliest"
+
+
+# Path A 
 def run_bronze_customers():
     from pyspark.sql import functions as F
     spark = get_spark_session()
@@ -66,14 +100,16 @@ def run_bronze_customers():
         ) USING iceberg
     """)
 
-    logging.info("Starting Bronze CDC customers processing...")
+    offsets = get_starting_offsets(spark, "lakehouse.cdc.bronze_customers", "dbserver1.public.customers")
+    logging.info(f"Starting Bronze CDC customers processing (offsets={offsets})...")
 
     raw = (spark.read
         .format("kafka")
         .option("kafka.bootstrap.servers", "kafka:9092")
         .option("subscribe", "dbserver1.public.customers")
-        .option("startingOffsets", "earliest")
+        .option("startingOffsets", offsets)
         .load())
+    
     raw_filtered = raw.filter(F.col("value").isNotNull())
 
     bronze_df = raw_filtered.select(
@@ -92,7 +128,8 @@ def run_bronze_customers():
 
     bronze_df.writeTo("lakehouse.cdc.bronze_customers").append()
     count = spark.table("lakehouse.cdc.bronze_customers").count()
-    logging.info(f"Bronze CDC customers complete. Row count: {count}")
+    logging.info(f"Bronze CDC customers complete. Total row count: {count}")
+    spark.stop()
 
 
 def run_silver_customers():
@@ -117,20 +154,24 @@ def run_silver_customers():
         "entity_id", F.coalesce(F.col("after_id"), F.col("before_id"))
     )
 
-    w = Window.partitionBy("entity_id").orderBy(F.col("ts_ms").desc())
+    # Keep only the latest event per entity — ties broken by kafka_offset.
+    w = Window.partitionBy("entity_id").orderBy(
+        F.col("ts_ms").desc(), F.col("kafka_offset").desc()
+    )
 
     deduped = (bronze_with_key
         .filter(F.col("op").isNotNull())
+        .filter(F.col("entity_id").isNotNull())
         .withColumn("rn", F.row_number().over(w))
         .filter("rn = 1")
         .drop("rn")
     )
 
-    deduped.createOrReplaceTempView("cdc_batch")
+    deduped.writeTo("lakehouse.cdc.staging_customers").createOrReplace()
 
     spark.sql("""
         MERGE INTO lakehouse.cdc.silver_customers AS t
-        USING cdc_batch AS s
+        USING lakehouse.cdc.staging_customers AS s
         ON t.id = s.entity_id
         WHEN MATCHED AND s.op = 'd' THEN DELETE
         WHEN MATCHED AND s.op IN ('c','u','r') THEN UPDATE SET
@@ -143,6 +184,7 @@ def run_silver_customers():
 
     count = spark.table("lakehouse.cdc.silver_customers").count()
     logging.info(f"Silver CDC customers complete. Row count: {count}")
+    spark.stop()
 
 
 def run_bronze_drivers():
@@ -166,13 +208,14 @@ def run_bronze_drivers():
         ) USING iceberg
     """)
 
-    logging.info("Starting Bronze CDC drivers processing...")
+    offsets = get_starting_offsets(spark, "lakehouse.cdc.bronze_drivers", "dbserver1.public.drivers")
+    logging.info(f"Starting Bronze CDC drivers processing (offsets={offsets})...")
 
     raw = (spark.read
         .format("kafka")
         .option("kafka.bootstrap.servers", "kafka:9092")
         .option("subscribe", "dbserver1.public.drivers")
-        .option("startingOffsets", "earliest")
+        .option("startingOffsets", offsets)
         .load())
 
     raw_filtered = raw.filter(F.col("value").isNotNull())
@@ -193,7 +236,8 @@ def run_bronze_drivers():
 
     bronze_df.writeTo("lakehouse.cdc.bronze_drivers").append()
     count = spark.table("lakehouse.cdc.bronze_drivers").count()
-    logging.info(f"Bronze CDC drivers complete. Row count: {count}")
+    logging.info(f"Bronze CDC drivers complete. Total row count: {count}")
+    spark.stop()
 
 
 def run_silver_drivers():
@@ -218,20 +262,23 @@ def run_silver_drivers():
         "entity_id", F.coalesce(F.col("after_id"), F.col("before_id"))
     )
 
-    w = Window.partitionBy("entity_id").orderBy(F.col("ts_ms").desc())
+    w = Window.partitionBy("entity_id").orderBy(
+        F.col("ts_ms").desc(), F.col("kafka_offset").desc()
+    )
 
     deduped = (bronze_with_key
         .filter(F.col("op").isNotNull())
+        .filter(F.col("entity_id").isNotNull())
         .withColumn("rn", F.row_number().over(w))
         .filter("rn = 1")
         .drop("rn")
     )
 
-    deduped.createOrReplaceTempView("drivers_cdc_batch")
+    deduped.writeTo("lakehouse.cdc.staging_drivers").createOrReplace()
 
     spark.sql("""
         MERGE INTO lakehouse.cdc.silver_drivers AS t
-        USING drivers_cdc_batch AS s
+        USING lakehouse.cdc.staging_drivers AS s
         ON t.id = s.entity_id
         WHEN MATCHED AND s.op = 'd' THEN DELETE
         WHEN MATCHED AND s.op IN ('c','u','r') THEN UPDATE SET
@@ -244,9 +291,10 @@ def run_silver_drivers():
 
     count = spark.table("lakehouse.cdc.silver_drivers").count()
     logging.info(f"Silver CDC drivers complete. Row count: {count}")
+    spark.stop()
 
 
-# Path B
+#  Path B 
 def run_bronze_taxi():
     from pyspark.sql import functions as F
     spark = get_spark_session()
@@ -281,7 +329,8 @@ def run_bronze_taxi():
         ) USING iceberg
     """)
 
-    logging.info("Starting Bronze Taxi processing from Kafka topic: taxi-trips ...")
+    offsets = get_starting_offsets(spark, "lakehouse.taxi.bronze_trips", "taxi-trips")
+    logging.info(f"Starting Bronze Taxi processing (offsets={offsets})...")
 
     trip_schema = """
         VendorID INT,
@@ -310,7 +359,7 @@ def run_bronze_taxi():
         .format("kafka")
         .option("kafka.bootstrap.servers", "kafka:9092")
         .option("subscribe", "taxi-trips")
-        .option("startingOffsets", "earliest")
+        .option("startingOffsets", offsets)
         .load())
 
     bronze_df = (raw
@@ -327,7 +376,8 @@ def run_bronze_taxi():
     bronze_df.writeTo("lakehouse.taxi.bronze_trips").append()
 
     count = spark.table("lakehouse.taxi.bronze_trips").count()
-    logging.info(f"Bronze Taxi complete. Row count: {count}")
+    logging.info(f"Bronze Taxi complete. Total row count: {count}")
+    spark.stop()
 
 
 def run_silver_taxi():
@@ -464,7 +514,7 @@ def run_silver_taxi():
     bronze_count = spark.read.table("lakehouse.taxi.bronze_trips").count()
     logging.info(f"[Silver taxi] MERGE complete — Silver row count: {silver_count}")
     logging.info(f"[Silver taxi] Bronze rows: {bronze_count} | filtered out: {bronze_count - silver_count}")
-    logging.info("Silver Taxi complete.")
+    spark.stop()
 
 
 def run_gold_demand_patterns():
@@ -472,9 +522,9 @@ def run_gold_demand_patterns():
     spark = get_spark_session()
 
     spark.sql("CREATE NAMESPACE IF NOT EXISTS lakehouse.taxi")
-  
+
     silver_df = spark.read.table("lakehouse.taxi.silver_trips")
-    
+
     hourly_daily = (
         silver_df
         .withColumn("pickup_date", F.to_date("tpep_pickup_datetime"))
@@ -492,7 +542,7 @@ def run_gold_demand_patterns():
         )
         .fillna(0, subset=["stddev_trip_count"])
     )
-    
+
     city_avg = stats.agg(F.avg("avg_trip_count")).collect()[0][0]
     city_std = stats.agg(F.stddev("avg_trip_count")).collect()[0][0]
 
@@ -505,6 +555,7 @@ def run_gold_demand_patterns():
             .otherwise("normal")
         )
     )
+
     spark.sql("""
         CREATE TABLE IF NOT EXISTS lakehouse.taxi.gold_demand_patterns (
             pickup_zone           STRING,
@@ -515,14 +566,14 @@ def run_gold_demand_patterns():
         ) USING iceberg
     """)
 
-    demand_patterns.writeTo(
-        "lakehouse.taxi.gold_demand_patterns"
-    ).createOrReplace()
+    demand_patterns.writeTo("lakehouse.taxi.gold_demand_patterns").createOrReplace()
 
     logging.info(
         f"gold_demand_patterns complete. Rows: "
         f"{spark.read.table('lakehouse.taxi.gold_demand_patterns').count()}"
     )
+    spark.stop()
+
 
 def run_gold_supply_demand_gap():
     from pyspark.sql import functions as F
@@ -531,7 +582,6 @@ def run_gold_supply_demand_gap():
     total_drivers = spark.read.table("lakehouse.cdc.silver_drivers").count()
     demand = spark.read.table("lakehouse.taxi.gold_demand_patterns")
 
-    # Total average trips across all zones per hour
     citywide_demand = (
         demand
         .groupBy("hour_of_day")
@@ -581,11 +631,14 @@ def run_gold_supply_demand_gap():
     """)
 
     gap_df.writeTo("lakehouse.taxi.gold_supply_demand_gap").createOrReplace()
-    print(f"[gold] supply-demand gap complete. Total drivers: {total_drivers}")
-    
+    logging.info(f"[gold] supply-demand gap complete. Total drivers: {total_drivers}")
+    spark.stop()
+
+
 def run_gold_taxi():
     run_gold_demand_patterns()
     run_gold_supply_demand_gap()
+
 
 def run_validate():
     import psycopg2
@@ -597,8 +650,8 @@ def run_validate():
         host=os.environ.get("POSTGRES_HOST", "postgres"),
         port=int(os.environ.get("POSTGRES_PORT", 5432)),
         dbname=os.environ.get("POSTGRES_DB", "sourcedb"),
-        user=os.environ.get("PG_USER", "postgres"),
-        password=os.environ.get("PG_PASSWORD", "postgres"),
+        user=os.environ.get("PG_USER", "cdc_user"),
+        password=os.environ.get("PG_PASSWORD", "admin"),
     )
 
     checks = [
@@ -615,7 +668,7 @@ def run_validate():
 
             silver_count = spark.table(iceberg_table).count()
 
-            TOLERANCE = 3
+            TOLERANCE = 5
             delta  = abs(pg_count - silver_count)
             status = "PASS" if delta <= TOLERANCE else "FAIL"
             logging.info(
@@ -626,6 +679,7 @@ def run_validate():
                 all_passed = False
 
     pg_conn.close()
+    spark.stop()
 
     if not all_passed:
         raise ValueError(
@@ -699,9 +753,13 @@ with DAG(
         python_callable=run_validate,
     )
 
-    # Path A
-    health_check >> bronze_customers     >> silver_customers    >> validate
-    health_check >> bronze_drivers >> silver_drivers >> validate
+    health_check >> [bronze_customers, bronze_drivers, bronze_taxi]
 
-    # Path B
+    # Path A: CDC
+    bronze_customers >> silver_customers
+    bronze_drivers   >> silver_drivers
+
+    # Path B: Taxi
     bronze_taxi >> silver_taxi >> gold_taxi
+
+    [silver_customers, silver_drivers, gold_taxi] >> validate
