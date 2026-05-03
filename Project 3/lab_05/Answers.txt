@@ -1,0 +1,12 @@
+Messages for 1.6:
+"payload":{"before":null,"after":{"id":115,"name":"Olivia Smith","email":"updated_115_304@test.net","country":"Italy","created_at":1776341866546749},"source":{"version":"3.0.8.Final","connector":"postgresql","name":"dbserver1","ts_ms":1776342093578,"snapshot":"first","db":"sourcedb","sequence":"[null,\"27579216\"]","ts_us":1776342093578683,"ts_ns":1776342093578683000,"schema":"public","table":"customers","txId":1463,"lsn":27579216,"xmin":null},"transaction":null,"op":"r","ts_ms":1776342093746,"ts_us":1776342093746064,"ts_ns":1776342093746064255}
+"payload":{"before":null,"after":{"id":46,"name":"Kai Johansson","email":"kai.johansson@mail.com","country":"Lithuania","created_at":1776341537524326},"source":{"version":"3.0.8.Final","connector":"postgresql","name":"dbserver1","ts_ms":1776342093578,"snapshot":"true","db":"sourcedb","sequence":"[null,\"27579216\"]","ts_us":1776342093578683,"ts_ns":1776342093578683000,"schema":"public","table":"customers","txId":1463,"lsn":27579216,"xmin":null},"transaction":null,"op":"r","ts_ms":1776342093751,"ts_us":1776342093751222,"ts_ns":1776342093751222920}
+
+Q: One sentence: what does op="r" mean, and when does Debezium produce these events?
+A: op="r" means that the event captured was from the initial read of the snapshot aka from where does Debezium start the "history" of the transaction. Basically all these r events are from the very beginning of tracking.
+
+Q: why is Bronze always append-only — why don’t we UPDATE or DELETE rows here?
+A: Because bronze is where all the raw information is stored so we can later on fully re-run the pipeline from scratch. It is basically the history of all changes to the db
+
+Q: what happens if you run the MERGE again without new data — does Silver change?
+A: No, it is indempotent based on the primary key
