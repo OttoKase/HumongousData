@@ -50,10 +50,7 @@ def text_representation(elements: list[tuple]) -> str:
 
 
 def run(run_id: str, screen_ids: list[int]) -> None:
-    """
-    For each screen: fetch JSON from MinIO, parse hierarchy,
-    write text representation back to MinIO as screens/{id}.txt
-    """
+
     s3     = _s3_client()
     bucket = os.environ["MINIO_BUCKET"]
 

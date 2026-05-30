@@ -54,7 +54,6 @@ def _s3_client():
 
 
 def _call_ollama(text_rep: str) -> dict:
-    """One Ollama call → parsed JSON dict. Raises on bad JSON or HTTP error."""
     prompt = PROMPT_TEMPLATE.replace("{hierarchy_text}", text_rep)
     response = requests.post(
         f"{os.environ['OLLAMA_URL']}/api/generate",
@@ -68,11 +67,6 @@ def _call_ollama(text_rep: str) -> dict:
 
 
 def run(run_id: str, screen_ids: list[int]) -> str:
-    """
-    For each screen: fetch text from MinIO, call Ollama, update screens_metadata.
-    Failed extractions go to screens_review_queue instead of crashing the task.
-    Returns prompt_version string for pipeline_runs.
-    """
     s3     = _s3_client()
     bucket = os.environ["MINIO_BUCKET"]
 
@@ -82,7 +76,6 @@ def run(run_id: str, screen_ids: list[int]) -> str:
     with psycopg2.connect(os.environ["POSTGRES_DSN"]) as conn:
         with conn.cursor() as cur:
             for sid in screen_ids:
-                # Fetch text representation
                 try:
                     raw = s3.get_object(Bucket=bucket, Key=f"screens/{sid}.txt")["Body"].read()
                     text_rep = raw.decode("utf-8")
@@ -94,7 +87,6 @@ def run(run_id: str, screen_ids: list[int]) -> str:
                     failed += 1
                     continue
 
-                # Call Ollama
                 try:
                     payload = _call_ollama(text_rep)
                 except json.JSONDecodeError as e:
@@ -112,7 +104,6 @@ def run(run_id: str, screen_ids: list[int]) -> str:
                     failed += 1
                     continue
 
-                # Update screens_metadata
                 confidence = float(payload.get("confidence", 0.0))
                 body = {k: v for k, v in payload.items() if k != "confidence"}
                 cur.execute(UPDATE_EXTRACTION_SQL, (

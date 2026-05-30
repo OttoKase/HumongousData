@@ -6,6 +6,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
+RUN mkdir -p /opt/airflow/.cache/huggingface && \
+    chown -R airflow: /opt/airflow/.cache
+
 USER airflow
 
 COPY requirements.txt /requirements.txt

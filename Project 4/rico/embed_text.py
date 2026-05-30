@@ -35,17 +35,11 @@ def _s3_client():
 
 
 def run(run_id: str, screen_ids: list[int]) -> str:
-    """
-    Fetch text representations from MinIO, embed with SBERT all-MiniLM-L6-v2,
-    insert into screens_embeddings with embedding_kind='text'.
-    Returns model_version string for pipeline_runs.
-    """
     s3     = _s3_client()
     bucket = os.environ["MINIO_BUCKET"]
 
     sbert = SentenceTransformer(SBERT_MODEL_VERSION)
 
-    # Fetch text representations from MinIO
     texts      = []
     text_bytes_list = []
     for sid in screen_ids:
@@ -53,7 +47,6 @@ def run(run_id: str, screen_ids: list[int]) -> str:
         texts.append(raw.decode("utf-8"))
         text_bytes_list.append(raw)
 
-    # Single batched encode — normalize so L2 == cosine distance
     vecs_np = sbert.encode(texts, normalize_embeddings=True).astype("float32")
 
     # Insert into Postgres

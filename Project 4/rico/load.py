@@ -11,21 +11,18 @@ def run(run_id: str, screen_ids: list[int]) -> None:
         register_vector(conn)
         with conn.cursor() as cur:
 
-            # Verify every screen has a metadata row
             cur.execute(
                 "SELECT COUNT(*) FROM screens_metadata WHERE screen_id = ANY(%s)",
                 (screen_ids,)
             )
             meta_count = cur.fetchone()[0]
 
-            # Verify embeddings exist for every screen (2 per screen: image + text)
             cur.execute(
                 "SELECT COUNT(*) FROM screens_embeddings WHERE screen_id = ANY(%s)",
                 (screen_ids,)
             )
             emb_count = cur.fetchone()[0]
 
-            # Verify run_id is set on all rows for this run
             cur.execute(
                 """
                 SELECT COUNT(*) FROM screens_metadata

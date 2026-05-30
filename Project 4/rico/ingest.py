@@ -35,11 +35,7 @@ def _s3_client():
 
 
 def run(run_id: str, limit: int) -> list[int]:
-    """
-    Stream `limit` screens from HuggingFace, PUT PNG + JSON to MinIO,
-    INSERT stub rows into screens_metadata.
-    Returns list of ingested screen_ids.
-    """
+
     s3 = _s3_client()
     bucket = os.environ["MINIO_BUCKET"]
 

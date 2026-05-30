@@ -12,9 +12,11 @@ down:
 clean:
 	docker compose down -v
 
+LIMIT ?= 5
+
 trigger:
 	docker compose exec airflow-scheduler airflow dags trigger rico_pipeline \
-		--conf '{"limit": $(LIMIT:-5)}'
+		--conf '{"limit": $(LIMIT)}'
 
 reset:
 	docker compose exec postgres psql -U rico -d rico -c \

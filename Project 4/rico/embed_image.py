@@ -48,17 +48,11 @@ def _load_model():
 
 
 def run(run_id: str, screen_ids: list[int]) -> str:
-    """
-    Fetch PNGs from MinIO, embed with CLIP ViT-B-32,
-    L2-normalise, insert into screens_embeddings.
-    Returns model_version string for pipeline_runs.
-    """
     s3     = _s3_client()
     bucket = os.environ["MINIO_BUCKET"]
 
     model, preprocess = _load_model()
 
-    # Fetch and preprocess all PNGs
     batch      = []
     png_bytes_list = []
     for sid in screen_ids:
@@ -69,13 +63,11 @@ def run(run_id: str, screen_ids: list[int]) -> str:
 
     images_tensor = torch.stack(batch)
 
-    # Single forward pass
     with torch.no_grad():
         vecs = model.encode_image(images_tensor)
         vecs = vecs / vecs.norm(dim=-1, keepdim=True)
     vecs_np = vecs.cpu().numpy().astype("float32")
 
-    # Insert into Postgres
     with psycopg2.connect(os.environ["POSTGRES_DSN"]) as conn:
         register_vector(conn)
         with conn.cursor() as cur:
