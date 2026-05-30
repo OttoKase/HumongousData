@@ -30,6 +30,7 @@ x-airflow-common: &airflow-common
   volumes:
     - ./dags:/opt/airflow/dags
     - ./rico:/opt/airflow/rico
+    - ./prompts:/opt/airflow/prompts 
     - airflow-logs:/opt/airflow/logs
     - hf-cache:/opt/airflow/.cache/huggingface
   depends_on:

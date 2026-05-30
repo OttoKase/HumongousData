@@ -7,26 +7,10 @@ import psycopg2
 import requests
 
 from rico.traceability import fingerprint
+import pathlib
 
 PROMPT_VERSION = "v1"
-PROMPT_TEMPLATE = """\
-You are a UI structure extractor for Android app screenshots.
-
-Given the visible text from one screen's view hierarchy, return a single
-JSON object with these fields:
-
-- "title": a short string naming the screen (e.g. "Login", "Settings",
-  "Search results"). Empty string if unclear.
-- "elements": a list of {"type": string, "text": string} objects, one
-  per salient interactive or informational element you can identify.
-- "confidence": a number in [0.0, 1.0] expressing how confident you are
-  in the extraction.
-
-Visible text:
-{hierarchy_text}
-
-Respond with valid JSON only — no commentary, no Markdown fences.
-"""
+PROMPT_TEMPLATE = pathlib.Path("prompts/extract_v1.txt").read_text()
 
 INSERT_REVIEW_SQL = """
     INSERT INTO screens_review_queue (screen_id, reason, raw_output, run_id, source_fingerprint)
