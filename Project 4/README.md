@@ -15,8 +15,6 @@ An Airflow DAG that ingests Android UI screenshots from the RICO dataset, embeds
 ## Setup
 
 ```bash
-git clone <repo>
-cd <repo>
 cp .env.example .env          # fill in SLACK_WEBHOOK_URL if desired
 make build                    # builds the Airflow image (~5 min on first run)
 make up                       # starts all 8 containers
@@ -257,48 +255,3 @@ Do not clear the failed audit task and re-run it — the audit found real data i
 
 ---
 
-## Screenshots to Include as Evidence
-
-### 1 — Successful run (all green)
-**How:** trigger `make trigger LIMIT=5`, wait for completion, open the Graph view in Airflow UI.
-**What to capture:** the full DAG graph with all task nodes green. Shows the pipeline runs end-to-end.
-
-### 2 — Parallel middle tasks
-**How:** same run as above, zoom into the graph around `embed_image`, `embed_text`, `extract`.
-**What to capture:** the three tasks visually branching from `parse_task` in parallel. Demonstrates the parallel execution design.
-
-### 3 — Run summary log
-**How:** in the successful run, click `observability_task` → Logs.
-**What to capture:** the `RUN SUMMARY` block printed at the end of the log showing duration, metadata rows, extraction %, high-confidence %, review queue %, and embedding stats.
-
-### 4 — Audit failure (circuit-breaker)
-**How:** run `make audit-test`, wait, open the Graph view of the new run.
-**What to capture:** `audit_task` red, `eval_task` grey/skipped. Shows the circuit-breaker halting the pipeline.
-
-### 5 — Audit details in the database
-**How:** after `make audit-test`, run:
-```bash
-docker compose exec postgres psql -U rico -d rico -c \
-  "SELECT run_id, passed, details FROM audit_results ORDER BY created_at DESC LIMIT 1;"
-```
-**What to capture:** the terminal output showing `passed=false` and the `details` JSONB with the duplicate `screen_id`. Shows the audit records evidence, not just fails.
-
-### 6 — Traceability query
-**How:** after a successful run, run:
-```bash
-docker compose exec postgres psql -U rico -d rico -c \
-  "SELECT m.screen_id, r.run_id, r.clip_version, r.sbert_version, r.llm_model, r.git_sha
-   FROM screens_metadata m JOIN pipeline_runs r USING (run_id) LIMIT 5;"
-```
-**What to capture:** terminal output showing each screen linked to its run with model versions. Demonstrates row-level traceability.
-
-### 7 — Idempotency proof
-**How:** trigger twice with the same LIMIT, then run:
-```bash
-docker compose exec postgres psql -U rico -d rico -c \
-  "SELECT COUNT(*) FROM screens_metadata; SELECT COUNT(*) FROM screens_embeddings;"
-```
-**What to capture:** two `pipeline_runs` rows in the DB but still only 5 metadata rows and 10 embedding rows. Shows re-runs don't duplicate data.
-
-### 8 — Slack notifications (if webhook configured)
-**What to capture:** the three Slack messages in your channel — started, succeeded, and the audit-failed alert from `make audit-test`. Shows all three notification events fire correctly.
