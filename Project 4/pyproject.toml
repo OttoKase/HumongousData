@@ -1,4 +1,38 @@
 [project]
-name = "rico-pipeline"
-version = "0.1.0"
+name            = "rico-pipeline"
+version         = "0.1.0"
 requires-python = ">=3.10"
+
+# Runtime dependencies mirror requirements.txt so `pip install -e .` works.
+dependencies = [
+    "psycopg2-binary==2.9.9",
+    "pgvector==0.3.6",
+    "requests==2.32.3",
+    "datasets==3.2.0",
+    "open-clip-torch==2.26.1",
+    "sentence-transformers==3.3.1",
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "boto3>=1.34",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "apache-airflow>=2.9",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Show print() output during tests (useful for debugging audit details)
+addopts   = "-v -s"
+
+[build-system]
+requires      = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[tool.setuptools.packages.find]
+# Make the rico/ directory a proper installable package
+where = ["."]
+include = ["rico*"]

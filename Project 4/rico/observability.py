@@ -4,6 +4,13 @@ import os
 
 import psycopg2
 
+from rico.embed_image import CLIP_MODEL_VERSION
+from rico.embed_text import SBERT_MODEL_VERSION
+
+EXPECTED_DIMS = {
+    "image": 512,   # CLIP ViT-B-32
+    "text":  384,   # SBERT all-MiniLM-L6-v2
+}
 
 INSERT_METRIC_SQL = """
     INSERT INTO pipeline_metrics (run_id, metric_name, metric_value, metric_text)
@@ -19,7 +26,6 @@ def run(run_id: str, task_durations: dict[str, float]) -> None:
 
     with psycopg2.connect(os.environ["POSTGRES_DSN"]) as conn:
         with conn.cursor() as cur:
-
 
             for task_name, duration in task_durations.items():
                 _record(cur, run_id, f"duration_s.{task_name}", value=duration)
@@ -63,7 +69,7 @@ def run(run_id: str, task_durations: dict[str, float]) -> None:
                     COUNT(*)                                              AS row_count,
                     ROUND(AVG(vector_dims(vector))::numeric, 0)::int      AS avg_dims,
                     ROUND(100.0 * COUNT(*) FILTER (
-                        WHERE vector_norm(vector) = 0
+                        WHERE (vector <#> vector) = 0
                     ) / COUNT(*), 2)                                      AS pct_zero_norm
                 FROM screens_embeddings
                 WHERE run_id = %s
@@ -76,15 +82,17 @@ def run(run_id: str, task_durations: dict[str, float]) -> None:
 
             for model_version, emb_kind, emb_count, avg_dims, pct_zero in emb_rows:
                 prefix = f"embeddings.{emb_kind}"
-                _record(cur, run_id, f"{prefix}.row_count",   value=float(emb_count))
-                _record(cur, run_id, f"{prefix}.avg_dims",    value=float(avg_dims))
+                _record(cur, run_id, f"{prefix}.row_count",     value=float(emb_count))
+                _record(cur, run_id, f"{prefix}.avg_dims",      value=float(avg_dims))
                 _record(cur, run_id, f"{prefix}.pct_zero_norm", value=float(pct_zero or 0))
                 _record(cur, run_id, f"{prefix}.model_version", text=model_version)
 
-                if avg_dims and avg_dims not in (512, 384):
+                expected = EXPECTED_DIMS.get(emb_kind)
+                if expected and avg_dims and avg_dims != expected:
                     print(
                         f"run_id={run_id} WARNING unexpected vector dims "
-                        f"model={model_version} kind={emb_kind} dims={avg_dims}"
+                        f"model={model_version} kind={emb_kind} "
+                        f"dims={avg_dims} expected={expected}"
                     )
 
             cur.execute(

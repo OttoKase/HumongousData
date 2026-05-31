@@ -13,6 +13,7 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
     AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: "5"
     AIRFLOW__SCHEDULER__PARSING_PROCESSES: "2"
+    AIRFLOW__SCHEDULER__ALLOW_TRIGGER_IN_FUTURE: "true"
     AIRFLOW__CORE__EXECUTE_TASKS_NEW_PYTHON_INTERPRETER: "True"
     AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-rico-pipeline-not-for-prod}
     AIRFLOW__API__AUTH_BACKENDS: "airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session"
@@ -30,7 +31,7 @@ x-airflow-common: &airflow-common
   volumes:
     - ./dags:/opt/airflow/dags
     - ./rico:/opt/airflow/rico
-    - ./prompts:/opt/airflow/prompts 
+    - ./prompts:/opt/airflow/prompts
     - airflow-logs:/opt/airflow/logs
     - hf-cache:/opt/airflow/.cache/huggingface
   depends_on:
@@ -49,6 +50,7 @@ services:
       - "5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # FIX: mount migrations/ folder (was pointing to root-level .sql file before)
       - ./migrations:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rico} -d ${POSTGRES_DB:-rico}"]

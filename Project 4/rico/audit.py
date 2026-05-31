@@ -14,13 +14,21 @@ INSERT_AUDIT_SQL = """
 
 
 def _check_metadata_duplicates(cur, run_id: str) -> list[int]:
+    """
+    Checks for screen_ids that appear in MORE THAN ONE pipeline run.
+    This catches the case where a screen was written by a previous run
+    and then written again by this run without the upsert working correctly,
+    leaving two pipeline_runs rows claiming the same screen_id.
+    """
     cur.execute(
         """
-        SELECT screen_id, COUNT(*) AS n
+        SELECT screen_id, COUNT(DISTINCT run_id) AS n_runs
         FROM screens_metadata
-        WHERE run_id = %s
+        WHERE screen_id IN (
+            SELECT screen_id FROM screens_metadata WHERE run_id = %s
+        )
         GROUP BY screen_id
-        HAVING COUNT(*) > 1
+        HAVING COUNT(DISTINCT run_id) > 1
         """,
         (run_id,)
     )
@@ -28,23 +36,30 @@ def _check_metadata_duplicates(cur, run_id: str) -> list[int]:
 
 
 def _check_embedding_duplicates(cur, run_id: str) -> list[dict]:
+    """
+    Checks for (screen_id, embedding_kind) combinations that appear in MORE
+    THAN ONE pipeline run. The primary key on screens_embeddings prevents
+    true row-level duplication, but this catches the case where a screen has
+    embeddings attributed to two different run_ids — meaning it was processed
+    twice and the upsert didn't consolidate them under a single run.
+    """
     cur.execute(
         """
-        SELECT screen_id, model_name, model_version, embedding_kind, COUNT(*) AS n
+        SELECT screen_id, embedding_kind, COUNT(DISTINCT run_id) AS n_runs
         FROM screens_embeddings
-        WHERE run_id = %s
-        GROUP BY screen_id, model_name, model_version, embedding_kind
-        HAVING COUNT(*) > 1
+        WHERE screen_id IN (
+            SELECT screen_id FROM screens_metadata WHERE run_id = %s
+        )
+        GROUP BY screen_id, embedding_kind
+        HAVING COUNT(DISTINCT run_id) > 1
         """,
         (run_id,)
     )
     return [
         {
             "screen_id":      row[0],
-            "model_name":     row[1],
-            "model_version":  row[2],
-            "embedding_kind": row[3],
-            "count":          row[4],
+            "embedding_kind": row[1],
+            "n_runs":         row[2],
         }
         for row in cur.fetchall()
     ]

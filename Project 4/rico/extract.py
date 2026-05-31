@@ -1,6 +1,7 @@
 # rico/extract.py
 import json
 import os
+import pathlib
 
 import boto3
 import psycopg2
@@ -54,18 +55,18 @@ def run(run_id: str, screen_ids: list[int]) -> str:
     s3     = _s3_client()
     bucket = os.environ["MINIO_BUCKET"]
 
-    ok = 0
+    ok     = 0
     failed = 0
 
     with psycopg2.connect(os.environ["POSTGRES_DSN"]) as conn:
         with conn.cursor() as cur:
             for sid in screen_ids:
                 try:
-                    raw = s3.get_object(Bucket=bucket, Key=f"screens/{sid}.txt")["Body"].read()
+                    raw      = s3.get_object(Bucket=bucket, Key=f"screens/{sid}.txt")["Body"].read()
                     text_rep = raw.decode("utf-8")
                 except Exception as e:
                     reason = f"text_missing: {e}"
-                    fp = fingerprint(str(sid).encode())
+                    fp     = fingerprint(str(sid).encode())
                     cur.execute(INSERT_REVIEW_SQL, (sid, reason, None, run_id, fp))
                     print(f"run_id={run_id} stage=extract screen_id={sid} reason={reason}")
                     failed += 1
@@ -75,21 +76,21 @@ def run(run_id: str, screen_ids: list[int]) -> str:
                     payload = _call_ollama(text_rep)
                 except json.JSONDecodeError as e:
                     reason = f"llm_bad_json: {e}"
-                    fp = fingerprint(text_rep.encode())
+                    fp     = fingerprint(text_rep.encode())
                     cur.execute(INSERT_REVIEW_SQL, (sid, reason, str(e), run_id, fp))
                     print(f"run_id={run_id} stage=extract screen_id={sid} reason={reason}")
                     failed += 1
                     continue
                 except Exception as e:
                     reason = f"llm_failed: {e}"
-                    fp = fingerprint(text_rep.encode())
+                    fp     = fingerprint(text_rep.encode())
                     cur.execute(INSERT_REVIEW_SQL, (sid, reason, str(e), run_id, fp))
                     print(f"run_id={run_id} stage=extract screen_id={sid} reason={reason}")
                     failed += 1
                     continue
 
                 confidence = float(payload.get("confidence", 0.0))
-                body = {k: v for k, v in payload.items() if k != "confidence"}
+                body       = {k: v for k, v in payload.items() if k != "confidence"}
                 cur.execute(UPDATE_EXTRACTION_SQL, (
                     json.dumps(body),
                     PROMPT_VERSION,

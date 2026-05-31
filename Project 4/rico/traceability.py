@@ -1,7 +1,9 @@
 # rico/traceability.py
+import hashlib
 import os
 import uuid
 from datetime import datetime, timezone
+
 import psycopg2
 
 
@@ -30,6 +32,9 @@ def start_run(dag_run_id: str, limit_param: int) -> str:
 
 def finish_run(run_id: str, status: str, model_versions: dict = None) -> None:
     model_versions = model_versions or {}
+    # FIX: fall back to OLLAMA_MODEL env var so llm_model is never NULL when the
+    # column was simply not passed by the caller (the old finalize task omitted it).
+    llm_model = model_versions.get("llm") or os.environ.get("OLLAMA_MODEL")
     sql = """
         UPDATE pipeline_runs
         SET ended_at       = %s,
@@ -47,15 +52,15 @@ def finish_run(run_id: str, status: str, model_versions: dict = None) -> None:
                 status,
                 model_versions.get("clip"),
                 model_versions.get("sbert"),
-                model_versions.get("llm"),
+                llm_model,
                 model_versions.get("prompt"),
                 run_id,
             ))
 
 
 def fingerprint(data: bytes) -> str:
-    import hashlib
     return hashlib.sha256(data).hexdigest()
+
 
 def get_run_metrics(run_id: str) -> dict:
     sql = """

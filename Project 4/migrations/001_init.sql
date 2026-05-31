@@ -36,7 +36,6 @@ CREATE TABLE IF NOT EXISTS pipeline_metrics (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-
 CREATE TABLE IF NOT EXISTS screens_metadata (
     screen_id           BIGINT PRIMARY KEY,
     app_package         TEXT,
@@ -65,12 +64,13 @@ CREATE TABLE IF NOT EXISTS screens_embeddings (
 );
 
 CREATE TABLE IF NOT EXISTS screens_review_queue (
-    id          BIGSERIAL PRIMARY KEY,
-    screen_id   BIGINT NOT NULL,
-    reason      TEXT NOT NULL,
-    raw_output  TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    run_id      UUID REFERENCES pipeline_runs(run_id)
+    id                  BIGSERIAL PRIMARY KEY,
+    screen_id           BIGINT NOT NULL,
+    reason              TEXT NOT NULL,
+    raw_output          TEXT,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    run_id              UUID REFERENCES pipeline_runs(run_id),
+    source_fingerprint  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS screens_eval (
